@@ -3,7 +3,7 @@ use std::error::Error;
 use reqwest::header::HeaderMap;
 use url::Url;
 
-use crate::ChunkRange;
+use crate::shared_types::ChunkRange;
 
 #[async_recursion::async_recursion]
 pub(crate) async fn get_headers_follow_redirects(url: &Url) -> Result<HeaderMap, Box<dyn Error>> {

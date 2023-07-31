@@ -1,29 +1,38 @@
 use std::error::Error;
 
-use clap::Parser;
-use futures::future;
 use thiserror::Error;
-use tokio::{
-    fs::{File, OpenOptions},
-    io::{AsyncSeekExt, AsyncWriteExt},
-    sync::mpsc,
-};
+
 use url::Url;
 
-use crate::{http_utils, ChunkRange};
+use crate::http_utils;
+use crate::shared_types::ChunkRange;
+
+pub(crate) fn url_to_resource_handle(url: &Url) -> Result<DownloadUrl, Box<dyn Error>> {
+    match url.scheme() {
+        "http" | "https" => Ok(DownloadUrl::Http(url.to_owned())),
+        "ftp" => Ok(DownloadUrl::Ftp(url.to_owned())),
+        _ => Err(format!("Unsupported scheme: {}", url.scheme()).into()),
+    }
+}
 
 #[derive(Error, Debug)]
 pub(crate) enum ResourceReadError {
     #[error("HTTP error: {0}")]
     Http(reqwest::Error),
-    #[error("Handle does not support partial content")]
-    NoPartialContentSupport,
     #[error("FTP error: {0}")]
     Ftp(String),
 }
 
+#[derive(Error, Debug)]
+pub(crate) enum ResourceGetError {
+    #[error("Resource read error: {0}")]
+    ReadError(ResourceReadError),
+    #[error("Handle does not support partial content")]
+    NoPartialContentSupport,
+}
+
 #[derive(Debug, Clone)]
-pub(crate) enum ResourceHandle {
+pub(crate) enum DownloadUrl {
     Ftp(Url),
     Http(Url),
 }
@@ -35,13 +44,13 @@ pub(crate) struct ResourceSpec {
     pub(crate) supports_splits: bool,
 }
 
-impl ResourceHandle {
+impl DownloadUrl {
     pub(crate) async fn get_specs(&self) -> Result<ResourceSpec, Box<dyn Error>> {
         match self {
-            ResourceHandle::Ftp(_url) => {
+            DownloadUrl::Ftp(_url) => {
                 todo!()
             }
-            ResourceHandle::Http(url) => {
+            DownloadUrl::Http(url) => {
                 let headers = http_utils::get_headers_follow_redirects(url).await?;
 
                 let supports_splits = headers
@@ -71,10 +80,10 @@ impl ResourceHandle {
 
     pub(crate) async fn infer_filename(&self) -> Result<String, Box<dyn Error>> {
         match self {
-            ResourceHandle::Ftp(_url) => {
+            DownloadUrl::Ftp(_url) => {
                 todo!()
             }
-            ResourceHandle::Http(url) => {
+            DownloadUrl::Http(url) => {
                 let headers = http_utils::get_headers_follow_redirects(url).await?;
                 Ok(http_utils::get_file_name_from_headers(&headers)
                     .unwrap_or_else(|| url.path_segments().unwrap().last().unwrap().to_owned()))
@@ -87,10 +96,10 @@ impl ResourceHandle {
         range: Option<ChunkRange>,
     ) -> Result<Vec<u8>, ResourceReadError> {
         match self {
-            ResourceHandle::Ftp(_url) => {
+            DownloadUrl::Ftp(_url) => {
                 todo!()
             }
-            ResourceHandle::Http(url) => Ok(http_utils::get(url, range)
+            DownloadUrl::Http(url) => Ok(http_utils::get(url, range)
                 .await
                 .map_err(ResourceReadError::Http))?,
         }
