@@ -46,9 +46,9 @@ pub(crate) async fn get(url: &Url, range: Option<ChunkRange>) -> Result<Vec<u8>,
 }
 
 pub(crate) fn get_file_name_from_headers(headers: &HeaderMap) -> Option<String> {
-    println!("headers are {headers:?}");
+    debug!("headers are {headers:?}");
     headers.get("Content-Disposition").map(|v| {
-        println!("v is {v:?}");
+        debug!("v is {v:?}");
         v.to_str()
             .unwrap()
             .split(';')

@@ -41,7 +41,7 @@ pub(crate) async fn start_download(
     let url = resource::url_to_resource_handle(&specs.url)?;
 
     let resource_specs = url.get_specs().await?;
-    println!("File to download has specs: {:?}", resource_specs);
+    debug!("File to download has specs: {:?}", resource_specs);
 
     let file_size = resource_specs.size;
     let chunk_count = match file_size {
@@ -54,6 +54,7 @@ pub(crate) async fn start_download(
         }
         None => 1,
     };
+    debug!("Chunk count: {}", chunk_count);
 
     let output_filename = match specs.output {
         Some(filename) => filename,
@@ -175,7 +176,7 @@ fn spawn_writer(
                     } as usize;
                     chunk_states[chunk_index] = ChunkState::Done;
                     chunks_received += 1;
-                    println!("chunk received");
+                    debug!("chunk received");
                     if chunks_received == chunk_count {
                         output_file.shutdown().await.expect("shutdown failed");
                         s_processing_q.close();
@@ -185,7 +186,7 @@ fn spawn_writer(
                 }
                 Err((e, chunk_spec)) => {
                     // TODO: use a logger
-                    eprintln!("Error downloading chunk: {}", e);
+                    error!("Error downloading chunk: {}", e);
                     s_processing_q
                         .clone()
                         .send(chunk_spec)
