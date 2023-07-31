@@ -9,9 +9,9 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::{sync::mpsc, task::JoinHandle};
 use url::Url;
 
-use crate::resource;
+use crate::resource::{self, ResourceGetError};
 
-use crate::resource::{DownloadUrl, ResourceReadError};
+use crate::resource::DownloadUrl;
 use crate::shared_types::ChunkRange;
 
 const MB_TO_BYTES: u32 = 1024 * 1024;
@@ -20,7 +20,7 @@ const CHUNK_SIZE: u32 = 10 * MB_TO_BYTES;
 type ChunkBoundaries = Option<ChunkRange>;
 type FileChunk = (Vec<u8>, ChunkBoundaries);
 type ChunkSpec = (DownloadUrl, ChunkBoundaries);
-type ChunkResult = Result<FileChunk, (ResourceReadError, ChunkSpec)>;
+type ChunkResult = Result<FileChunk, (ResourceGetError, ChunkSpec)>;
 
 pub(crate) struct DownloadPreferences {
     pub(crate) url: Url,

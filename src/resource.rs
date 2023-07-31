@@ -20,7 +20,7 @@ pub(crate) enum ResourceReadError {
     #[error("HTTP error: {0}")]
     Http(reqwest::Error),
     #[error("FTP error: {0}")]
-    Ftp(String),
+    _Ftp(String),
 }
 
 #[derive(Error, Debug)]
@@ -94,14 +94,16 @@ impl DownloadUrl {
     pub(crate) async fn read_range(
         &self,
         range: Option<ChunkRange>,
-    ) -> Result<Vec<u8>, ResourceReadError> {
+    ) -> Result<Vec<u8>, ResourceGetError> {
         match self {
             DownloadUrl::Ftp(_url) => {
                 todo!()
             }
+            // TODO: we need to check if the server supports partial content (in case we're
+            // requesting a range)
             DownloadUrl::Http(url) => Ok(http_utils::get(url, range)
                 .await
-                .map_err(ResourceReadError::Http))?,
+                .map_err(|e| ResourceGetError::ReadError(ResourceReadError::Http(e))))?,
         }
     }
 }
