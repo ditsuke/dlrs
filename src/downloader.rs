@@ -177,6 +177,9 @@ fn spawn_writer(
                     chunks_received += 1;
                     println!("chunk received");
                     if chunks_received == chunk_count {
+                        output_file.shutdown().await.expect("shutdown failed");
+                        s_processing_q.close();
+                        r_chunks.close();
                         break;
                     }
                 }
