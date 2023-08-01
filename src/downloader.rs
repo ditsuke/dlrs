@@ -12,13 +12,13 @@ use url::Url;
 use crate::resource::{self, ResourceGetError};
 
 use crate::resource::DownloadUrl;
-use crate::shared_types::ChunkRange;
+use crate::shared_types::{Byte, ChunkRange};
 
 const MB_TO_BYTES: u32 = 1024 * 1024;
 const CHUNK_SIZE: u32 = 10 * MB_TO_BYTES;
 
 type ChunkBoundaries = Option<ChunkRange>;
-type FileChunk = (Vec<u8>, ChunkBoundaries);
+type FileChunk = (Vec<Byte>, ChunkBoundaries);
 type ChunkSpec = (DownloadUrl, ChunkBoundaries);
 type ChunkResult = Result<FileChunk, (ResourceGetError, ChunkSpec)>;
 
@@ -83,6 +83,7 @@ pub(crate) async fn start_download(
 
     let (tx_chunks, rx_chunks) = mpsc::channel::<ChunkResult>(splits as usize);
     let (tx_processing_q, rx_processing_q) = async_channel::unbounded::<ChunkSpec>();
+    let (s_progress, r_progress) = mpsc::channel::<u32>(splits as usize);
 
     let mut handles = vec![];
 
@@ -106,8 +107,14 @@ pub(crate) async fn start_download(
     for _ in 0..splits {
         let rx_processing_q = rx_processing_q.clone();
         let tx_chunks = tx_chunks.clone();
-        handles.push(spawn_download_worker(rx_processing_q, tx_chunks));
+        handles.push(spawn_download_worker(
+            rx_processing_q,
+            tx_chunks,
+            s_progress.clone(),
+        ));
     }
+
+    spawn_progress_reporter(file_size, r_progress);
 
     // Send splits to download queue
     future::join_all(
@@ -125,11 +132,17 @@ pub(crate) async fn start_download(
 fn spawn_download_worker(
     r_processing_q: async_channel::Receiver<ChunkSpec>,
     s_chunks: mpsc::Sender<ChunkResult>,
+    s_progress: mpsc::Sender<u32>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok((handle, bounds)) = r_processing_q.recv().await {
             match handle.read_range(bounds).await {
                 Ok(chunk) => {
+                    // TODO: we need to stream progress for more "real time" progress
+                    s_progress
+                        .send(chunk.len() as u32)
+                        .await
+                        .expect("send failed");
                     s_chunks
                         .send(Ok((chunk, bounds)))
                         .await
@@ -143,6 +156,7 @@ fn spawn_download_worker(
                 }
             }
         }
+        debug!("stopping download worker");
     })
 }
 
@@ -185,7 +199,6 @@ fn spawn_writer(
                     }
                 }
                 Err((e, chunk_spec)) => {
-                    // TODO: use a logger
                     error!("Error downloading chunk: {}", e);
                     s_processing_q
                         .clone()
@@ -194,6 +207,26 @@ fn spawn_writer(
                         .expect("send failed");
                 }
             }
+        }
+    })
+}
+
+fn spawn_progress_reporter(
+    total_size: Option<u32>,
+    mut rx_progres: mpsc::Receiver<u32>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut progress = 0;
+        while let Some(chunk_size) = rx_progres.recv().await {
+            progress += chunk_size;
+            info!(
+                "Progress: {}/{}",
+                progress,
+                match total_size {
+                    Some(size) => format!("{size}"),
+                    None => "unknown".into(),
+                }
+            );
         }
     })
 }

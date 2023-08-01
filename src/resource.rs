@@ -5,7 +5,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::http_utils;
-use crate::shared_types::ChunkRange;
+use crate::shared_types::{Byte, ChunkRange};
 
 pub(crate) fn url_to_resource_handle(url: &Url) -> Result<DownloadUrl, Box<dyn Error>> {
     match url.scheme() {
@@ -94,7 +94,7 @@ impl DownloadUrl {
     pub(crate) async fn read_range(
         &self,
         range: Option<ChunkRange>,
-    ) -> Result<Vec<u8>, ResourceGetError> {
+    ) -> Result<Vec<Byte>, ResourceGetError> {
         match self {
             DownloadUrl::Ftp(_url) => {
                 todo!()
