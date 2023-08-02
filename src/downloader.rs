@@ -13,7 +13,7 @@ use url::Url;
 use crate::resource::{self, ResourceGetError};
 
 use crate::resource::DownloadUrl;
-use crate::shared_types::{ChunkRange};
+use crate::shared_types::ChunkRange;
 
 const MB_TO_BYTES: u32 = 1024 * 1024;
 const CHUNK_SIZE: u32 = 10 * MB_TO_BYTES;
@@ -21,7 +21,10 @@ const CHUNK_SIZE: u32 = 10 * MB_TO_BYTES;
 type ChunkBoundaries = Option<ChunkRange>;
 type FileChunk = (Bytes, ChunkBoundaries);
 type ChunkSpec = (DownloadUrl, ChunkBoundaries);
-type ChunkResult = Result<FileChunk, (ResourceGetError, ChunkSpec)>;
+enum DownloadUpdate {
+    Chunk(Result<FileChunk, (ResourceGetError, ChunkSpec)>),
+    Complete,
+}
 
 pub(crate) struct DownloadPreferences {
     pub(crate) url: Url,
@@ -46,16 +49,10 @@ pub(crate) async fn start_download(
 
     let file_size = resource_specs.size;
     let chunk_count = match file_size {
-        Some(size) => {
-            if resource_specs.supports_splits {
-                size / CHUNK_SIZE + 1
-            } else {
-                1
-            }
-        }
-        None => 1,
+        Some(size) => Some(size / CHUNK_SIZE + 1),
+        None => None,
     };
-    debug!("Chunk count: {}", chunk_count);
+    debug!("Chunk count: {:?}", chunk_count);
 
     let output_filename = match specs.output {
         Some(filename) => filename,
@@ -68,23 +65,26 @@ pub(crate) async fn start_download(
         }
     };
 
-    let chunk_bounds = (0..chunk_count)
-        .map(|i| {
-            let start = i * CHUNK_SIZE;
-            let end = cmp::min(start + CHUNK_SIZE, file_size.unwrap_or(0));
-            ChunkRange { start, end }
-        })
-        .collect::<Vec<_>>();
+    let chunk_bounds = match chunk_count {
+        Some(count) => (0..count)
+            .map(|i| {
+                let start = i * CHUNK_SIZE;
+                let end = cmp::min(start + CHUNK_SIZE, file_size.unwrap_or(0));
+                ChunkRange { start, end }
+            })
+            .collect::<Vec<_>>(),
+        None => vec![ChunkRange { start: 0, end: 0 }],
+    };
 
-    let splits = if resource_specs.supports_splits {
+    let download_worker_count = if resource_specs.supports_splits {
         specs.preferred_splits
     } else {
         1
     };
 
-    let (tx_chunks, rx_chunks) = mpsc::channel::<ChunkResult>(splits as usize);
-    let (tx_processing_q, rx_processing_q) = async_channel::unbounded::<ChunkSpec>();
-    let (s_progress, r_progress) = mpsc::channel::<u32>(splits as usize);
+    let (s_update, r_update) = mpsc::channel::<DownloadUpdate>(download_worker_count as usize);
+    let (s_processing_q, r_processing_q) = async_channel::unbounded::<ChunkSpec>();
+    let (s_progress, r_progress) = mpsc::channel::<u32>(download_worker_count as usize);
 
     let mut handles = vec![];
 
@@ -100,18 +100,19 @@ pub(crate) async fn start_download(
     handles.push(spawn_writer(
         file,
         chunk_count,
-        rx_chunks,
-        tx_processing_q.clone(),
+        r_update,
+        s_processing_q.clone(),
     ));
 
     // download workers
-    for _ in 0..splits {
-        let rx_processing_q = rx_processing_q.clone();
-        let tx_chunks = tx_chunks.clone();
+    for _ in 0..download_worker_count {
+        let rx_processing_q = r_processing_q.clone();
+        let tx_chunks = s_update.clone();
         handles.push(spawn_download_worker(
             rx_processing_q,
             tx_chunks,
             s_progress.clone(),
+            download_worker_count == 1,
         ));
     }
 
@@ -121,7 +122,7 @@ pub(crate) async fn start_download(
     future::join_all(
         chunk_bounds
             .iter()
-            .map(|bound| tx_processing_q.send((url.clone(), Some(*bound))))
+            .map(|bound| s_processing_q.send((url.clone(), Some(*bound))))
             .collect::<Vec<_>>(),
     )
     .await;
@@ -132,8 +133,9 @@ pub(crate) async fn start_download(
 
 fn spawn_download_worker(
     r_processing_q: async_channel::Receiver<ChunkSpec>,
-    s_chunks: mpsc::Sender<ChunkResult>,
+    s_chunks: mpsc::Sender<DownloadUpdate>,
     s_progress: mpsc::Sender<u32>,
+    solo_worker: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok((handle, bounds)) = r_processing_q.recv().await {
@@ -142,7 +144,7 @@ fn spawn_download_worker(
                 .await
                 .try_for_each(|chunk| async {
                     s_chunks
-                        .send(Ok((chunk, bounds)))
+                        .send(DownloadUpdate::Chunk(Ok((chunk, bounds))))
                         .await
                         .expect("send failed");
                     Ok(())
@@ -151,6 +153,13 @@ fn spawn_download_worker(
                 .ok();
         }
         debug!("stopping download worker");
+        if solo_worker {
+            debug!("sending completion signal");
+            s_chunks
+                .send(DownloadUpdate::Complete)
+                .await
+                .expect("send failed");
+        }
     })
 }
 
@@ -162,17 +171,17 @@ enum ChunkState {
 
 fn spawn_writer(
     mut output_file: File,
-    chunk_count: u32,
-    mut r_chunks: mpsc::Receiver<ChunkResult>,
+    chunk_count: Option<u32>,
+    mut r_chunks: mpsc::Receiver<DownloadUpdate>,
     s_processing_q: async_channel::Sender<ChunkSpec>,
 ) -> JoinHandle<()> {
-    let mut chunk_states = vec![ChunkState::Pending; chunk_count as usize];
+    let mut chunk_states = chunk_count.map(|count| vec![ChunkState::Pending; count as usize]);
 
     tokio::spawn(async move {
         let mut chunks_received = 0;
         while let Some(chunk) = r_chunks.recv().await {
             match chunk {
-                Ok(chunk) => {
+                DownloadUpdate::Chunk(Ok(chunk)) => {
                     write_file_chunk(&mut output_file, &chunk)
                         .await
                         .expect("write failed");
@@ -182,23 +191,32 @@ fn spawn_writer(
                     } else {
                         0
                     } as usize;
-                    chunk_states[chunk_index] = ChunkState::Done;
+                    if let Some(ref mut states) = chunk_states {
+                        states[chunk_index] = ChunkState::Done;
+                    }
                     chunks_received += 1;
                     debug!("chunk received");
-                    if chunks_received == chunk_count {
-                        output_file.shutdown().await.expect("shutdown failed");
-                        s_processing_q.close();
-                        r_chunks.close();
-                        break;
+                    if let Some(count) = chunk_count {
+                        if count == chunks_received {
+                            output_file.shutdown().await.expect("shutdown failed");
+                            s_processing_q.close();
+                            r_chunks.close();
+                            break;
+                        }
                     }
                 }
-                Err((e, chunk_spec)) => {
+
+                DownloadUpdate::Chunk(Err((e, chunk_spec))) => {
                     error!("Error downloading chunk: {}", e);
                     s_processing_q
                         .clone()
                         .send(chunk_spec)
                         .await
                         .expect("send failed");
+                }
+                DownloadUpdate::Complete => {
+                    debug!("download complete (completion signal received)");
+                    break;
                 }
             }
         }
