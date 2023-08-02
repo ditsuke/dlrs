@@ -2,7 +2,10 @@ use std::error::Error;
 
 use async_stream::try_stream;
 use bytes::{Bytes, BytesMut};
+
 use futures::{Stream, StreamExt};
+
+
 use thiserror::Error;
 
 use tokio::sync::mpsc;
@@ -56,6 +59,7 @@ impl DownloadUrl {
             }
             DownloadUrl::Http(url) => {
                 let headers = http_utils::get_headers_follow_redirects(url).await?;
+                debug!("headers: {:?}", headers);
 
                 let supports_splits = headers
                     .get("Accept-Ranges")
@@ -69,9 +73,12 @@ impl DownloadUrl {
                     })
                     .unwrap_or(false);
 
-                let size = headers
+                let mut size = headers
                     .get("Content-Length")
                     .map(|v| v.to_str().unwrap().parse::<u32>().unwrap());
+                if size == Some(0) {
+                    size = None;
+                }
 
                 Ok(ResourceSpec {
                     url: url.clone(),
@@ -104,25 +111,29 @@ impl DownloadUrl {
         match u {
             DownloadUrl::Http(url) => {
                 try_stream! {
-                    // let mut stream = self.read_range(range, s_progress).await;
                     let mut stream = http_utils::get_stream(&url, range).await?;
-                    let buffer_cap = if let Some(range) = range {
+                    let buffer_capacity = if let Some(range) = range {
                         (range.end - range.start) as usize
                     } else {
-                        1000
+                        1000 // TODO: WTF``
                     };
-                    let mut buffer = BytesMut::with_capacity(buffer_cap);
-                    let mut cum = 0;
-                    while let Some(v) = stream.next().await {
-                        let v = v?;
-                        cum += v.len();
-                        s_progress.try_send(v.len() as u32).ok();
-                        buffer.extend_from_slice(&v);
-                        if cum >= buffer_cap {
+                    let mut buffer = BytesMut::with_capacity(buffer_capacity);
+                    let mut cumulative = 0;
+
+                    while let Some(sub_chunk) = stream.next().await {
+                        let sub_chunk = sub_chunk?;
+                        cumulative += sub_chunk.len();
+                        s_progress.try_send(sub_chunk.len() as u32).ok();
+                        buffer.extend_from_slice(&sub_chunk);
+                        if cumulative >= buffer_capacity {
                             yield buffer.freeze();
-                            cum = 0;
-                            buffer = BytesMut::with_capacity(buffer_cap);
+                            cumulative = 0;
+                            buffer = BytesMut::with_capacity(buffer_capacity);
                         }
+                    }
+
+                    if !buffer.is_empty() {
+                        yield buffer.freeze();
                     }
                 }
             }

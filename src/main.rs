@@ -7,11 +7,17 @@ mod http_utils;
 mod resource;
 mod shared_types;
 
-use std::error::Error;
+use std::{
+    error::Error,
+    io::{stdout, Write},
+};
 
 use clap::Parser;
 use downloader::{start_download, DownloadPreferences, DownloadProgress};
 
+use indicatif::MultiProgress;
+use indicatif_log_bridge::LogWrapper;
+use simplelog::TermLogger;
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -30,12 +36,25 @@ struct CliArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    simplelog::TermLogger::init(
+    // simplelog::TermLogger::init(
+    //     simplelog::LevelFilter::Debug,
+    //     simplelog::Config::default(),
+    //     simplelog::TerminalMode::Mixed,
+    //     simplelog::ColorChoice::Auto,
+    // )?;
+    let multi = MultiProgress::new();
+    let logger = TermLogger::new(
         simplelog::LevelFilter::Debug,
         simplelog::Config::default(),
         simplelog::TerminalMode::Mixed,
         simplelog::ColorChoice::Auto,
-    )?;
+    );
+
+    // set_boxed_logger(logger);
+
+    LogWrapper::new(multi.clone(), logger)
+        .try_init()
+        .expect("failed to init global logger");
 
     debug!("Starting up");
 
@@ -44,14 +63,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let url = Url::parse(args.url.as_ref())?;
     let preferred_splits = args.splits;
 
-    let (tx_progress, _rx_progress) = mpsc::channel::<DownloadProgress>(preferred_splits as usize);
+    let (_tx_progress, _rx_progress) = mpsc::channel::<DownloadProgress>(preferred_splits as usize);
 
     let dl_specs = DownloadPreferences {
         url,
         preferred_splits,
         output: args.output,
     };
-    start_download(dl_specs, tx_progress).await?;
+    start_download(dl_specs, multi).await?;
 
+    debug!("Download complete");
+    log::logger().flush();
+    stdout().flush().ok();
     Ok(())
 }

@@ -59,7 +59,7 @@ pub(crate) async fn get(url: &Url, range: Option<ChunkRange>) -> Result<Vec<u8>,
         .await?
         .error_for_status()?;
 
-    if matches!(range, Some(_)) && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+    if range.is_some() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(GetError::NoPartialContentSupport);
     }
 
@@ -88,7 +88,7 @@ pub(crate) async fn get_stream(
         .await?
         .error_for_status()?;
 
-    if matches!(range, Some(_)) && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+    if range.is_some() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(GetError::NoPartialContentSupport);
     }
 

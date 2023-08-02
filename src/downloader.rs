@@ -4,6 +4,9 @@ use std::io::SeekFrom;
 
 use bytes::Bytes;
 use futures::{future, TryStreamExt};
+
+use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
+
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -16,7 +19,7 @@ use crate::resource::DownloadUrl;
 use crate::shared_types::ChunkRange;
 
 const MB_TO_BYTES: u32 = 1024 * 1024;
-const CHUNK_SIZE: u32 = 10 * MB_TO_BYTES;
+const CHUNK_SIZE: u32 = 2 * MB_TO_BYTES;
 
 type ChunkBoundaries = Option<ChunkRange>;
 type FileChunk = (Bytes, ChunkBoundaries);
@@ -39,20 +42,12 @@ pub(crate) struct DownloadProgress {
 
 pub(crate) async fn start_download(
     specs: DownloadPreferences,
-    // TODO: implement progress reporting back to the master
-    _s_progress: mpsc::Sender<DownloadProgress>,
+    multi: MultiProgress,
 ) -> Result<(), Box<dyn Error>> {
     let url = resource::url_to_resource_handle(&specs.url)?;
 
     let resource_specs = url.get_specs().await?;
     debug!("File to download has specs: {:?}", resource_specs);
-
-    let file_size = resource_specs.size;
-    let chunk_count = match file_size {
-        Some(size) => Some(size / CHUNK_SIZE + 1),
-        None => None,
-    };
-    debug!("Chunk count: {:?}", chunk_count);
 
     let output_filename = match specs.output {
         Some(filename) => filename,
@@ -65,15 +60,21 @@ pub(crate) async fn start_download(
         }
     };
 
+    let file_size = resource_specs.size;
+    let chunk_count = match (file_size, resource_specs.supports_splits) {
+        (Some(size), true) => Some((size as f32 / CHUNK_SIZE as f32).ceil() as u32),
+        _ => None,
+    };
+    debug!("File size: {:?}", file_size);
     let chunk_bounds = match chunk_count {
         Some(count) => (0..count)
             .map(|i| {
                 let start = i * CHUNK_SIZE;
                 let end = cmp::min(start + CHUNK_SIZE, file_size.unwrap_or(0));
-                ChunkRange { start, end }
+                Some(ChunkRange { start, end })
             })
             .collect::<Vec<_>>(),
-        None => vec![ChunkRange { start: 0, end: 0 }],
+        None => vec![None],
     };
 
     let download_worker_count = if resource_specs.supports_splits {
@@ -81,6 +82,7 @@ pub(crate) async fn start_download(
     } else {
         1
     };
+    debug!("downloading with {download_worker_count} workers");
 
     let (s_update, r_update) = mpsc::channel::<DownloadUpdate>(download_worker_count as usize);
     let (s_processing_q, r_processing_q) = async_channel::unbounded::<ChunkSpec>();
@@ -116,18 +118,19 @@ pub(crate) async fn start_download(
         ));
     }
 
-    spawn_progress_reporter(file_size, r_progress);
+    spawn_progress_reporter(file_size, r_progress, multi);
 
     // Send splits to download queue
     future::join_all(
         chunk_bounds
             .iter()
-            .map(|bound| s_processing_q.send((url.clone(), Some(*bound))))
+            .map(|bound| s_processing_q.send((url.clone(), *bound)))
             .collect::<Vec<_>>(),
     )
     .await;
 
     futures::future::join_all(handles).await;
+    debug!("exiting download function");
     Ok(())
 }
 
@@ -135,7 +138,7 @@ fn spawn_download_worker(
     r_processing_q: async_channel::Receiver<ChunkSpec>,
     s_chunks: mpsc::Sender<DownloadUpdate>,
     s_progress: mpsc::Sender<u32>,
-    solo_worker: bool,
+    single_chunk: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok((handle, bounds)) = r_processing_q.recv().await {
@@ -150,16 +153,14 @@ fn spawn_download_worker(
                     Ok(())
                 })
                 .await
-                .ok();
+                .unwrap();
+            if single_chunk {
+                // debug!("sending completion signal");
+
+                s_chunks.send(DownloadUpdate::Complete).await.ok();
+            }
         }
-        debug!("stopping download worker");
-        if solo_worker {
-            debug!("sending completion signal");
-            s_chunks
-                .send(DownloadUpdate::Complete)
-                .await
-                .expect("send failed");
-        }
+        // debug!("stopping download worker");
     })
 }
 
@@ -167,6 +168,17 @@ fn spawn_download_worker(
 enum ChunkState {
     Done,
     Pending,
+}
+
+macro_rules! windup {
+    ($file:ident, $s_processing:ident, $r_chunks:ident) => {
+        // debug!("winding up: because we think we're done with things!");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        $file.shutdown().await.expect("shutdown failed");
+        $s_processing.close();
+        $r_chunks.close();
+        break;
+    };
 }
 
 fn spawn_writer(
@@ -194,15 +206,15 @@ fn spawn_writer(
                     if let Some(ref mut states) = chunk_states {
                         states[chunk_index] = ChunkState::Done;
                     }
+
                     chunks_received += 1;
-                    debug!("chunk received");
-                    if let Some(count) = chunk_count {
-                        if count == chunks_received {
-                            output_file.shutdown().await.expect("shutdown failed");
-                            s_processing_q.close();
-                            r_chunks.close();
-                            break;
-                        }
+                    let we_are_done = match chunk_count {
+                        Some(count) => chunks_received == count,
+                        None => false,
+                    };
+                    if we_are_done {
+                        debug!("download complete (all chunks received)");
+                        windup!(output_file, s_processing_q, r_chunks);
                     }
                 }
 
@@ -214,9 +226,10 @@ fn spawn_writer(
                         .await
                         .expect("send failed");
                 }
+
                 DownloadUpdate::Complete => {
                     debug!("download complete (completion signal received)");
-                    break;
+                    windup!(output_file, s_processing_q, r_chunks);
                 }
             }
         }
@@ -225,21 +238,26 @@ fn spawn_writer(
 
 fn spawn_progress_reporter(
     total_size: Option<u32>,
-    mut rx_progres: mpsc::Receiver<u32>,
+    mut rx_progress: mpsc::Receiver<u32>,
+    multi: MultiProgress,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut progress = 0;
-        while let Some(chunk_size) = rx_progres.recv().await {
+
+        let pb = total_size.map_or_else(ProgressBar::new_spinner, |size| {
+            ProgressBar::new(size as u64)
+        });
+        let pb = multi.add(pb);
+        pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+        .unwrap()
+        .with_key("eta", |state: &ProgressState, w: &mut dyn std::fmt::Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
+        .progress_chars("#>-"));
+
+        while let Some(chunk_size) = rx_progress.recv().await {
             progress += chunk_size;
-            info!(
-                "Progress: {}/{}",
-                progress,
-                match total_size {
-                    Some(size) => format!("{size}"),
-                    None => "unknown".into(),
-                }
-            );
+            pb.set_position(progress as u64);
         }
+        pb.finish_with_message("DLD");
     })
 }
 
@@ -254,5 +272,6 @@ async fn write_file_chunk(file: &mut File, chunk: &FileChunk) -> Result<(), Writ
     file.write_all(chunk.0.as_ref())
         .await
         .expect("write failed");
+    file.flush().await.expect("flush failed");
     Ok(())
 }
