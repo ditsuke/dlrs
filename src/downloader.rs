@@ -2,7 +2,8 @@ use std::cmp;
 use std::error::Error;
 use std::io::SeekFrom;
 
-use futures::future;
+use bytes::Bytes;
+use futures::{future, TryStreamExt};
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -12,13 +13,13 @@ use url::Url;
 use crate::resource::{self, ResourceGetError};
 
 use crate::resource::DownloadUrl;
-use crate::shared_types::{Byte, ChunkRange};
+use crate::shared_types::{ChunkRange};
 
 const MB_TO_BYTES: u32 = 1024 * 1024;
 const CHUNK_SIZE: u32 = 10 * MB_TO_BYTES;
 
 type ChunkBoundaries = Option<ChunkRange>;
-type FileChunk = (Vec<Byte>, ChunkBoundaries);
+type FileChunk = (Bytes, ChunkBoundaries);
 type ChunkSpec = (DownloadUrl, ChunkBoundaries);
 type ChunkResult = Result<FileChunk, (ResourceGetError, ChunkSpec)>;
 
@@ -136,25 +137,18 @@ fn spawn_download_worker(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok((handle, bounds)) = r_processing_q.recv().await {
-            match handle.read_range(bounds).await {
-                Ok(chunk) => {
-                    // TODO: we need to stream progress for more "real time" progress
-                    s_progress
-                        .send(chunk.len() as u32)
-                        .await
-                        .expect("send failed");
+            handle
+                .stream_range(bounds, s_progress.clone())
+                .await
+                .try_for_each(|chunk| async {
                     s_chunks
                         .send(Ok((chunk, bounds)))
                         .await
                         .expect("send failed");
-                }
-                Err(e) => {
-                    s_chunks
-                        .send(Err((e, (handle, bounds))))
-                        .await
-                        .expect("send failed");
-                }
-            }
+                    Ok(())
+                })
+                .await
+                .ok();
         }
         debug!("stopping download worker");
     })

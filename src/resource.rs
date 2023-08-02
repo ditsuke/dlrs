@@ -1,11 +1,15 @@
 use std::error::Error;
 
+use async_stream::try_stream;
+use bytes::{Bytes, BytesMut};
+use futures::{Stream, StreamExt};
 use thiserror::Error;
 
+use tokio::sync::mpsc;
 use url::Url;
 
-use crate::http_utils;
-use crate::shared_types::{Byte, ChunkRange};
+use crate::http_utils::{self, GetError};
+use crate::shared_types::ChunkRange;
 
 pub(crate) fn url_to_resource_handle(url: &Url) -> Result<DownloadUrl, Box<dyn Error>> {
     match url.scheme() {
@@ -91,19 +95,38 @@ impl DownloadUrl {
         }
     }
 
-    pub(crate) async fn read_range(
+    pub(crate) async fn stream_range(
         &self,
         range: Option<ChunkRange>,
-    ) -> Result<Vec<Byte>, ResourceGetError> {
-        match self {
-            DownloadUrl::Ftp(_url) => {
-                todo!()
+        s_progress: mpsc::Sender<u32>,
+    ) -> impl Stream<Item = Result<Bytes, GetError>> {
+        let u = self.clone();
+        match u {
+            DownloadUrl::Http(url) => {
+                try_stream! {
+                    // let mut stream = self.read_range(range, s_progress).await;
+                    let mut stream = http_utils::get_stream(&url, range).await?;
+                    let buffer_cap = if let Some(range) = range {
+                        (range.end - range.start) as usize
+                    } else {
+                        1000
+                    };
+                    let mut buffer = BytesMut::with_capacity(buffer_cap);
+                    let mut cum = 0;
+                    while let Some(v) = stream.next().await {
+                        let v = v?;
+                        cum += v.len();
+                        s_progress.try_send(v.len() as u32).ok();
+                        buffer.extend_from_slice(&v);
+                        if cum >= buffer_cap {
+                            yield buffer.freeze();
+                            cum = 0;
+                            buffer = BytesMut::with_capacity(buffer_cap);
+                        }
+                    }
+                }
             }
-            // TODO: we need to check if the server supports partial content (in case we're
-            // requesting a range)
-            DownloadUrl::Http(url) => Ok(http_utils::get(url, range)
-                .await
-                .map_err(|e| ResourceGetError::ReadError(ResourceReadError::Http(e))))?,
+            _ => todo!(),
         }
     }
 }
