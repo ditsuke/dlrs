@@ -54,7 +54,7 @@ pub(crate) async fn start_download(
     let output_filename = match specs.output {
         Some(filename) => filename,
         None => {
-            if let Ok(filename) = url.infer_filename().await {
+            if let Some(filename) = resource_specs.inferred_filename {
                 filename
             } else {
                 "download".into() // TODO: come up with a better default way

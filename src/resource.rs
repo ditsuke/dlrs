@@ -48,6 +48,7 @@ pub(crate) struct ResourceSpec {
     pub(crate) url: Url,
     pub(crate) size: Option<u32>,
     pub(crate) supports_splits: bool,
+    pub(crate) inferred_filename: Option<String>,
 }
 
 impl DownloadUrl {
@@ -57,7 +58,7 @@ impl DownloadUrl {
                 todo!()
             }
             DownloadUrl::Http(url) => {
-                let headers = http_utils::get_headers_follow_redirects(url).await?;
+                let (headers, url) = http_utils::get_headers_follow_redirects(url).await?;
                 debug!("headers: {:?}", headers);
 
                 let supports_splits = headers
@@ -79,27 +80,36 @@ impl DownloadUrl {
                     size = None;
                 }
 
+                let inferred_filename = http_utils::get_file_name_from_headers(&headers)
+                    .unwrap_or_else(|| url.path_segments().unwrap().last().unwrap().to_owned());
+                let inferred_filename = if inferred_filename.is_empty() {
+                    None
+                } else {
+                    Some(inferred_filename)
+                };
+
                 Ok(ResourceSpec {
                     url: url.clone(),
                     size,
                     supports_splits,
+                    inferred_filename,
                 })
             }
         }
     }
 
-    pub(crate) async fn infer_filename(&self) -> Result<String, Box<dyn Error>> {
-        match self {
-            DownloadUrl::Ftp(_url) => {
-                todo!()
-            }
-            DownloadUrl::Http(url) => {
-                let headers = http_utils::get_headers_follow_redirects(url).await?;
-                Ok(http_utils::get_file_name_from_headers(&headers)
-                    .unwrap_or_else(|| url.path_segments().unwrap().last().unwrap().to_owned()))
-            }
-        }
-    }
+    // pub(crate) async fn infer_filename(&self) -> Result<String, Box<dyn Error>> {
+    //     match self {
+    //         DownloadUrl::Ftp(_url) => {
+    //             todo!()
+    //         }
+    //         DownloadUrl::Http(url) => {
+    //             let headers = http_utils::get_headers_follow_redirects(url).await?;
+    //             Ok(http_utils::get_file_name_from_headers(&headers)
+    //                 .unwrap_or_else(|| url.path_segments().unwrap().last().unwrap().to_owned()))
+    //         }
+    //     }
+    // }
 
     pub(crate) async fn stream_range(
         &self,

@@ -9,7 +9,9 @@ use url::Url;
 use crate::shared_types::ChunkRange;
 
 #[async_recursion::async_recursion]
-pub(crate) async fn get_headers_follow_redirects(url: &Url) -> Result<HeaderMap, Box<dyn Error>> {
+pub(crate) async fn get_headers_follow_redirects(
+    url: &Url,
+) -> Result<(HeaderMap, Url), Box<dyn Error>> {
     let http_client = reqwest::Client::new();
     let headers = http_client
         .head(url.as_str())
@@ -19,11 +21,12 @@ pub(crate) async fn get_headers_follow_redirects(url: &Url) -> Result<HeaderMap,
         .headers()
         .to_owned();
     if headers.get("Location").is_some() {
+        debug!("Redirecting to {:?}", headers.get("Location").unwrap());
         let new_url = headers.get("Location").unwrap().to_str().unwrap();
         let new_url = Url::parse(new_url)?;
         get_headers_follow_redirects(&new_url).await?;
     }
-    Ok(headers)
+    Ok((headers, url.clone()))
 }
 
 #[derive(Error, Debug)]
