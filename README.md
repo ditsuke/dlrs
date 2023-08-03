@@ -3,6 +3,8 @@
 `dlrs` is a multi-protocol download tool for the command line. Written in Rust, dlrs
 splits your downloads to speed them up where possible.
 
+![dlrs demo](./examples/demo.gif)
+
 ## Features
 
 - [x] **Split downloads:** dlrs can split your download into multiple segments that are then pulled in parallel,
