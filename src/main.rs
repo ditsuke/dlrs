@@ -34,7 +34,7 @@ struct CliArgs {
 async fn main() -> Result<(), Box<dyn Error>> {
     let multi_progress = MultiProgress::new();
     let logger = TermLogger::new(
-        simplelog::LevelFilter::Debug,
+        simplelog::LevelFilter::Error,
         simplelog::Config::default(),
         simplelog::TerminalMode::Mixed,
         simplelog::ColorChoice::Auto,
