@@ -1,7 +1,7 @@
 use std::cmp;
 use std::error::Error;
 use std::io::SeekFrom;
-use std::ops::Sub;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +20,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use url::Url;
 
 use crate::http_utils::GetError;
-use crate::resource::{self, ResourceGetError};
+use crate::resource::{self};
 
 use crate::resource::DownloadUrl;
 use crate::shared_types::{ByteCount, ChunkRange};
