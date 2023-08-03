@@ -31,39 +31,13 @@ pub(crate) enum GetError {
     #[error("Failed to GET resource: {0}")]
     Native(reqwest::Error),
     #[error("Resource handle does not support partial content (RANGE)")]
-    NoPartialContentSupport,
+    NoPartialContentSupportWhenceRequested,
 }
 
 impl From<reqwest::Error> for GetError {
     fn from(e: reqwest::Error) -> Self {
         GetError::Native(e)
     }
-}
-
-pub(crate) async fn get(url: &Url, range: Option<ChunkRange>) -> Result<Vec<u8>, GetError> {
-    let http_client = reqwest::Client::new();
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(range) = range {
-        headers.insert(
-            reqwest::header::RANGE,
-            format!("bytes={}-{}", range.start, range.end)
-                .parse()
-                .unwrap(),
-        );
-    }
-
-    let response = http_client
-        .get(url.to_owned())
-        .headers(headers)
-        .send()
-        .await?
-        .error_for_status()?;
-
-    if range.is_some() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(GetError::NoPartialContentSupport);
-    }
-
-    Ok(response.bytes().await?.to_vec())
 }
 
 pub(crate) async fn get_stream(
@@ -89,7 +63,7 @@ pub(crate) async fn get_stream(
         .error_for_status()?;
 
     if range.is_some() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(GetError::NoPartialContentSupport);
+        return Err(GetError::NoPartialContentSupportWhenceRequested);
     }
 
     Ok(response.bytes_stream().map_err(GetError::from))
@@ -97,31 +71,12 @@ pub(crate) async fn get_stream(
 
 pub(crate) fn get_file_name_from_headers(headers: &HeaderMap) -> Option<String> {
     debug!("headers are {headers:?}");
-    headers.get("Content-Disposition").map(|v| {
-        debug!("v is {v:?}");
-        v.to_str()
-            .unwrap()
-            .split(';')
-            .map(|s| s.trim())
-            .find(|s| s.starts_with("filename="))
-            .map(|s| s.replace("filename=", ""))
-            .unwrap()
-    })
-    // .or_else(|| {
-    //     headers
-    //         .get("Content-Type")
-    //         .map(|v| {
-    //             v.to_str()
-    //                 .unwrap()
-    //                 .split(';')
-    //                 .map(|s| s.trim())
-    //                 .find(|s| s.starts_with("filename="))
-    //                 .map(|s| s.replace("filename=", ""))
-    //         })
-    //         .or_else(|| {
-    //             headers
-    //                 .get("Location")
-    //                 .map(|v| v.to_str().unwrap().to_owned())
-    //         })
-    // })
+    headers
+        .get("Content-Disposition")?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(|s| s.trim())
+        .find(|s| s.starts_with("filename="))
+        .map(|s| s.replace("filename=", ""))
 }

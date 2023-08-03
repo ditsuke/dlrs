@@ -7,10 +7,7 @@ mod http_utils;
 mod resource;
 mod shared_types;
 
-use std::{
-    error::Error,
-    io::{stdout, Write},
-};
+use std::error::Error;
 
 use clap::Parser;
 use downloader::{start_download, DownloadPreferences};
@@ -18,7 +15,6 @@ use downloader::{start_download, DownloadPreferences};
 use indicatif::MultiProgress;
 use indicatif_log_bridge::LogWrapper;
 use simplelog::TermLogger;
-use tokio::sync::mpsc;
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -36,7 +32,7 @@ struct CliArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let multi = MultiProgress::new();
+    let multi_progress = MultiProgress::new();
     let logger = TermLogger::new(
         simplelog::LevelFilter::Debug,
         simplelog::Config::default(),
@@ -44,11 +40,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         simplelog::ColorChoice::Auto,
     );
 
-    LogWrapper::new(multi.clone(), logger)
+    LogWrapper::new(multi_progress.clone(), logger)
         .try_init()
         .expect("failed to init global logger");
-
-    debug!("Starting up");
 
     let args = CliArgs::parse();
 
@@ -61,7 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         output: args.output,
     };
 
-    start_download(preferences, multi).await?;
+    start_download(preferences, multi_progress).await?;
 
     debug!("Download complete");
     log::logger().flush();

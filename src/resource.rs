@@ -5,14 +5,13 @@ use bytes::{Bytes, BytesMut};
 
 use futures::{Stream, StreamExt};
 
-
 use thiserror::Error;
 
 use tokio::sync::mpsc;
 use url::Url;
 
 use crate::http_utils::{self, GetError};
-use crate::shared_types::ChunkRange;
+use crate::shared_types::{ByteCount, ChunkRange};
 
 pub(crate) fn url_to_resource_handle(url: &Url) -> Result<DownloadUrl, Box<dyn Error>> {
     match url.scheme() {
@@ -105,13 +104,28 @@ impl DownloadUrl {
     pub(crate) async fn stream_range(
         &self,
         range: Option<ChunkRange>,
-        s_progress: mpsc::Sender<u32>,
+        s_progress: mpsc::Sender<ByteCount>,
     ) -> impl Stream<Item = Result<Bytes, GetError>> {
         let u = self.clone();
         match u {
             DownloadUrl::Http(url) => {
                 try_stream! {
                     let mut stream = http_utils::get_stream(&url, range).await?;
+
+                    // HACK: this feels so wrong on so many levels.
+                    // While I can't exactly figure out a "good" way to do this,
+                    // The solution should be verification of chunks and whether
+                    // they're done or not on the end of the writer.
+                    // OKAY, idea: the writer maintains an array of of chunks,
+                    // keeping track Chunk::ToBeWritten, along with the start
+                    // and end of the chunk. When a chunk is written, it's
+                    // marked as Chunk::Written only if the entire chunk was
+                    // written. If the chunk was only partially written, it's
+                    // Chunk::ToBeWritten bytecount is updated to reflect the
+                    // remaining bytes to be written. Once the chunk is
+                    // completely written we can update the chunks_written
+                    // counter and move on to the next chunk, thus allowing
+                    // it to figure out the termination condition on its own too.
                     let buffer_capacity = if let Some(range) = range {
                         (range.end - range.start + 1) as usize
                     } else {
@@ -123,7 +137,7 @@ impl DownloadUrl {
                     while let Some(sub_chunk) = stream.next().await {
                         let sub_chunk = sub_chunk?;
                         cumulative += sub_chunk.len();
-                        s_progress.try_send(sub_chunk.len() as u32).ok();
+                        s_progress.try_send(sub_chunk.len() as ByteCount).ok();
                         buffer.extend_from_slice(&sub_chunk);
                         if cumulative >= buffer_capacity {
                             yield buffer.freeze();

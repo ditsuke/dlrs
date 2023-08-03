@@ -4,4 +4,4 @@ pub(crate) struct ChunkRange {
     pub(crate) end: u32,
 }
 
-pub(crate) type Byte = u8;
+pub(crate) type ByteCount = u64;
