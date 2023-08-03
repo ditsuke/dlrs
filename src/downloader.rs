@@ -300,7 +300,14 @@ fn spawn_progress_reporter(
             let mut q = progress_q.write().await;
             q.push_back((progress, Instant::now()));
         }
-        pb.finish_with_message("DLD");
+        let speed = progress as f64 / pb.elapsed().as_secs_f64();
+        let (unit, speed) = if speed > 1024.0 {
+            ("MB/s", speed / (1024.0 * 1024.0))
+        } else {
+            ("kB/s", speed / 1024.0)
+        };
+        pb.finish_with_message(format!("({:.1} {})", speed, unit));
+        println!("");
     })
 }
 
