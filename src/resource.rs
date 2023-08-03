@@ -113,7 +113,7 @@ impl DownloadUrl {
                 try_stream! {
                     let mut stream = http_utils::get_stream(&url, range).await?;
                     let buffer_capacity = if let Some(range) = range {
-                        (range.end - range.start) as usize
+                        (range.end - range.start + 1) as usize
                     } else {
                         1000 // TODO: WTF``
                     };
