@@ -35,11 +35,6 @@ pub(crate) struct DownloadPreferences {
     pub(crate) output: Option<String>,
 }
 
-pub(crate) struct DownloadProgress {
-    done: u64,
-    total: Option<u64>,
-}
-
 pub(crate) async fn start_download(
     specs: DownloadPreferences,
     multi: MultiProgress,

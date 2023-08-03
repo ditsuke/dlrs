@@ -13,7 +13,7 @@ use std::{
 };
 
 use clap::Parser;
-use downloader::{start_download, DownloadPreferences, DownloadProgress};
+use downloader::{start_download, DownloadPreferences};
 
 use indicatif::MultiProgress;
 use indicatif_log_bridge::LogWrapper;
@@ -36,12 +36,6 @@ struct CliArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // simplelog::TermLogger::init(
-    //     simplelog::LevelFilter::Debug,
-    //     simplelog::Config::default(),
-    //     simplelog::TerminalMode::Mixed,
-    //     simplelog::ColorChoice::Auto,
-    // )?;
     let multi = MultiProgress::new();
     let logger = TermLogger::new(
         simplelog::LevelFilter::Debug,
@@ -49,8 +43,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         simplelog::TerminalMode::Mixed,
         simplelog::ColorChoice::Auto,
     );
-
-    // set_boxed_logger(logger);
 
     LogWrapper::new(multi.clone(), logger)
         .try_init()
@@ -63,17 +55,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let url = Url::parse(args.url.as_ref())?;
     let preferred_splits = args.splits;
 
-    let (_tx_progress, _rx_progress) = mpsc::channel::<DownloadProgress>(preferred_splits as usize);
-
-    let dl_specs = DownloadPreferences {
+    let preferences = DownloadPreferences {
         url,
         preferred_splits,
         output: args.output,
     };
-    start_download(dl_specs, multi).await?;
+
+    start_download(preferences, multi).await?;
 
     debug!("Download complete");
     log::logger().flush();
-    stdout().flush().ok();
     Ok(())
 }
