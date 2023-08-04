@@ -113,7 +113,7 @@ pub(crate) async fn start_download(
         r_processing_q: r_processing_q.clone(),
         s_chunks: s_chunks.clone(),
         s_progress: s_progress.clone(),
-        single_chunk_dl: download_worker_count == 1,
+        single_chunk_dl: matches!(chunk_count, Some(1) | None),
     };
     for _ in 0..download_worker_count {
         handles.push(download_worker.spawn());
