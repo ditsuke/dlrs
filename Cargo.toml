@@ -1,9 +1,11 @@
 [package]
 name = "dlrs"
+description = "Multi-protocol CLI download accelerator"
+license = "MIT"
+keywords = ["cli", "async", "download-tool"]
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+readme = "README.md"
 
 [dependencies]
 async-channel = "1.9.0"
