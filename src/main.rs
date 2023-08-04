@@ -4,6 +4,7 @@ extern crate simplelog;
 
 mod downloader;
 mod http_utils;
+mod progress_reporter;
 mod resource;
 mod shared_types;
 
