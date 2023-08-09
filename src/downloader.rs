@@ -8,6 +8,7 @@ use futures::{future, TryStreamExt};
 
 use indicatif::MultiProgress;
 
+
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -15,11 +16,11 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::{sync::mpsc, task::JoinHandle};
 use url::Url;
 
-use crate::http_utils::GetError;
-use crate::progress_reporter::spawn_progress_reporter;
-use crate::resource::{self};
 
-use crate::resource::DownloadUrl;
+use crate::progress_reporter::spawn_progress_reporter;
+use crate::resource::{ResourceError};
+
+use crate::resource::ResourceHandle;
 use crate::shared_types::{ByteCount, ChunkRange};
 
 const MB_TO_BYTES: u32 = 1024 * 1024;
@@ -27,9 +28,9 @@ const CHUNK_SIZE: u32 = 2 * MB_TO_BYTES;
 
 type ChunkBoundaries = Option<ChunkRange>;
 type FileChunk = (Bytes, ChunkBoundaries);
-type ChunkSpec = (DownloadUrl, ChunkBoundaries);
+type ChunkSpec = (ResourceHandle, ChunkBoundaries);
 enum DownloadUpdate {
-    Chunk(Result<FileChunk, (GetError, ChunkSpec)>),
+    Chunk(Result<FileChunk, (ResourceError, ChunkSpec)>),
     Complete,
 }
 
@@ -43,9 +44,9 @@ pub(crate) async fn start_download(
     specs: DownloadPreferences,
     multi: MultiProgress,
 ) -> Result<(), Box<dyn Error>> {
-    let url = resource::url_to_resource_handle(&specs.url)?;
+    let handle = ResourceHandle::try_from(&specs.url)?;
 
-    let resource_specs = url.get_specs().await?;
+    let resource_specs = handle.get_specs().await?;
     debug!("File to download has specs: {:?}", resource_specs);
 
     let output_filename = match specs.output {
@@ -116,6 +117,7 @@ pub(crate) async fn start_download(
         single_chunk_dl: matches!(chunk_count, Some(1) | None),
     };
     for _ in 0..download_worker_count {
+        let download_worker = download_worker.clone();
         handles.push(download_worker.spawn());
     }
 
@@ -125,7 +127,7 @@ pub(crate) async fn start_download(
     future::join_all(
         chunk_bounds
             .iter()
-            .map(|bound| s_processing_q.send((url.clone(), *bound)))
+            .map(|bound| s_processing_q.send((handle.clone(), *bound)))
             .collect::<Vec<_>>(),
     )
     .await;
@@ -144,16 +146,15 @@ struct DownloadWorker {
 }
 
 impl DownloadWorker {
-    fn spawn(&self) -> JoinHandle<()> {
-        let t = self.clone();
+    fn spawn(self) -> JoinHandle<()> {
         tokio::spawn(async move {
-            while let Ok((handle, bounds)) = t.r_processing_q.recv().await {
+            while let Ok((handle, bounds)) = self.r_processing_q.recv().await {
                 let r = handle
-                    .stream_range(bounds, t.s_progress.clone())
+                    .stream_range(bounds, self.s_progress.clone())
                     .await
                     .try_for_each(|chunk| async {
                         debug!("sending chunk for bounds {bounds:?} to writer");
-                        t.s_chunks
+                        self.s_chunks
                             .send(DownloadUpdate::Chunk(Ok((chunk, bounds))))
                             .await
                             .expect("failed to send file chunk to writer");
@@ -161,14 +162,14 @@ impl DownloadWorker {
                     })
                     .await;
                 if let Err(e) = r {
-                    t.s_chunks
+                    self.s_chunks
                         .send(DownloadUpdate::Chunk(Err((e, (handle, bounds)))))
                         .await
                         .expect("failed to send error to writer");
                 }
 
-                if t.single_chunk_dl {
-                    t.s_chunks.send(DownloadUpdate::Complete).await.ok();
+                if self.single_chunk_dl {
+                    self.s_chunks.send(DownloadUpdate::Complete).await.ok();
                 }
             }
         })

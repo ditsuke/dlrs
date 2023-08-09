@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::time::Duration;
 
 use async_stream::try_stream;
 use bytes::{Bytes, BytesMut};
@@ -10,19 +11,11 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use url::Url;
 
-use crate::http_utils::{self, GetError};
+use crate::http_utils;
 use crate::shared_types::{ByteCount, ChunkRange};
 
-pub(crate) fn url_to_resource_handle(url: &Url) -> Result<DownloadUrl, Box<dyn Error>> {
-    match url.scheme() {
-        "http" | "https" => Ok(DownloadUrl::Http(url.to_owned())),
-        "ftp" => Ok(DownloadUrl::Ftp(url.to_owned())),
-        _ => Err(format!("Unsupported scheme: {}", url.scheme()).into()),
-    }
-}
-
 #[derive(Error, Debug)]
-pub(crate) enum ResourceReadError {
+pub(crate) enum ReadError {
     #[error("HTTP error: {0}")]
     Http(reqwest::Error),
     #[error("FTP error: {0}")]
@@ -30,17 +23,54 @@ pub(crate) enum ResourceReadError {
 }
 
 #[derive(Error, Debug)]
-pub(crate) enum ResourceGetError {
+pub(crate) enum ResourceError {
     #[error("Resource read error: {0}")]
-    ReadError(ResourceReadError),
+    ReadError(ReadError),
     #[error("Handle does not support partial content")]
     NoPartialContentSupport,
 }
 
+impl From<http_utils::GetError> for ResourceError {
+    fn from(e: http_utils::GetError) -> Self {
+        match e {
+            http_utils::GetError::Http(e) => ResourceError::ReadError(ReadError::Http(e)),
+            http_utils::GetError::NoPartialContentSupportWhenceRequested => {
+                ResourceError::NoPartialContentSupport
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-pub(crate) enum DownloadUrl {
+pub(crate) enum ResourceHandle {
     Ftp(Url),
-    Http(Url),
+    Http { url: Url, client: reqwest::Client },
+}
+
+#[derive(Error, Debug)]
+pub(crate) enum HandleCreationError {
+    #[error("Unsupported protocol: {protocol}")]
+    UnsupportedProtocol { protocol: String },
+    #[error("Http client error: {0}")]
+    Http(#[from] reqwest::Error),
+}
+
+impl TryFrom<&Url> for ResourceHandle {
+    type Error = HandleCreationError;
+    fn try_from(url: &Url) -> Result<Self, Self::Error> {
+        match url.scheme() {
+            "http" | "https" => Ok(ResourceHandle::Http {
+                url: url.to_owned(),
+                client: reqwest::Client::builder()
+                    .tcp_keepalive(Some(Duration::from_secs(2)))
+                    .build()?,
+            }),
+            "ftp" => Ok(ResourceHandle::Ftp(url.to_owned())),
+            scheme => Err(HandleCreationError::UnsupportedProtocol {
+                protocol: scheme.into(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -51,14 +81,14 @@ pub(crate) struct ResourceSpec {
     pub(crate) inferred_filename: Option<String>,
 }
 
-impl DownloadUrl {
+impl ResourceHandle {
     pub(crate) async fn get_specs(&self) -> Result<ResourceSpec, Box<dyn Error>> {
         match self {
-            DownloadUrl::Ftp(_url) => {
+            ResourceHandle::Ftp(_url) => {
                 todo!()
             }
-            DownloadUrl::Http(url) => {
-                let (headers, url) = http_utils::get_headers_follow_redirects(url).await?;
+            ResourceHandle::Http { client, url } => {
+                let (headers, url) = http_utils::get_headers_follow_redirects(client, url).await?;
                 debug!("headers: {:?}", headers);
 
                 let supports_splits = headers
@@ -98,29 +128,16 @@ impl DownloadUrl {
         }
     }
 
-    // pub(crate) async fn infer_filename(&self) -> Result<String, Box<dyn Error>> {
-    //     match self {
-    //         DownloadUrl::Ftp(_url) => {
-    //             todo!()
-    //         }
-    //         DownloadUrl::Http(url) => {
-    //             let headers = http_utils::get_headers_follow_redirects(url).await?;
-    //             Ok(http_utils::get_file_name_from_headers(&headers)
-    //                 .unwrap_or_else(|| url.path_segments().unwrap().last().unwrap().to_owned()))
-    //         }
-    //     }
-    // }
-
     pub(crate) async fn stream_range(
         &self,
         range: Option<ChunkRange>,
         s_progress: mpsc::Sender<ByteCount>,
-    ) -> impl Stream<Item = Result<Bytes, GetError>> {
-        let u = self.clone();
-        match u {
-            DownloadUrl::Http(url) => {
+    ) -> impl Stream<Item = Result<Bytes, ResourceError>> {
+        match self {
+            ResourceHandle::Http { client, url } => {
+                let (client, url) = (client.clone(), url.clone());
                 try_stream! {
-                    let mut stream = http_utils::get_stream(&url, range).await?;
+                    let mut stream = http_utils::get_stream(&client, &url, range).await?;
 
                     // HACK: this feels so wrong on so many levels.
                     // While I can't exactly figure out a "good" way to do this,

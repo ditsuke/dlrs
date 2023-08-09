@@ -2,7 +2,7 @@ use std::error::Error;
 
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
-use reqwest::header::HeaderMap;
+use reqwest::{header::HeaderMap, Client};
 use thiserror::Error;
 use url::Url;
 
@@ -10,10 +10,10 @@ use crate::shared_types::ChunkRange;
 
 #[async_recursion::async_recursion]
 pub(crate) async fn get_headers_follow_redirects(
+    client: &Client,
     url: &Url,
 ) -> Result<(HeaderMap, Url), Box<dyn Error>> {
-    let http_client = reqwest::Client::new();
-    let headers = http_client
+    let headers = client
         .head(url.as_str())
         .send()
         .await?
@@ -24,7 +24,7 @@ pub(crate) async fn get_headers_follow_redirects(
         debug!("Redirecting to {:?}", headers.get("Location").unwrap());
         let new_url = headers.get("Location").unwrap().to_str().unwrap();
         let new_url = Url::parse(new_url)?;
-        get_headers_follow_redirects(&new_url).await?;
+        get_headers_follow_redirects(client, &new_url).await?;
     }
     Ok((headers, url.clone()))
 }
@@ -32,22 +32,16 @@ pub(crate) async fn get_headers_follow_redirects(
 #[derive(Error, Debug)]
 pub(crate) enum GetError {
     #[error("Failed to GET resource: {0}")]
-    Native(reqwest::Error),
+    Http(#[from] reqwest::Error),
     #[error("Resource handle does not support partial content (RANGE)")]
     NoPartialContentSupportWhenceRequested,
 }
 
-impl From<reqwest::Error> for GetError {
-    fn from(e: reqwest::Error) -> Self {
-        GetError::Native(e)
-    }
-}
-
 pub(crate) async fn get_stream(
+    client: &Client,
     url: &Url,
     range: Option<ChunkRange>,
 ) -> Result<impl Stream<Item = Result<Bytes, GetError>>, GetError> {
-    let http_client = reqwest::Client::new();
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(range) = range {
         headers.insert(
@@ -58,7 +52,7 @@ pub(crate) async fn get_stream(
         );
     }
 
-    let response = http_client
+    let response = client
         .get(url.to_owned())
         .headers(headers)
         .send()

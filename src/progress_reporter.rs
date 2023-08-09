@@ -11,6 +11,30 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::shared_types::ByteCount;
 
+pub(crate) struct ProgressReporter {
+    rx_progress: mpsc::Receiver<ByteCount>,
+    total_size: Option<u32>,
+    multi_progress: MultiProgress,
+}
+
+impl ProgressReporter {
+    pub(crate) fn new(
+        rx_progress: mpsc::Receiver<ByteCount>,
+        total_size: Option<u32>,
+        multi_progress: MultiProgress,
+    ) -> Self {
+        Self {
+            rx_progress,
+            total_size,
+            multi_progress,
+        }
+    }
+
+    pub(crate) fn spawn(self) -> JoinHandle<()> {
+        spawn_progress_reporter(self.total_size, self.rx_progress, self.multi_progress)
+    }
+}
+
 pub(crate) fn spawn_progress_reporter(
     total_size: Option<u32>,
     mut rx_progress: mpsc::Receiver<ByteCount>,
@@ -29,6 +53,7 @@ pub(crate) fn spawn_progress_reporter(
         .with_key("eta", |state: &ProgressState, w: &mut dyn std::fmt::Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
         .progress_chars("#>-"));
 
+        // Spawn a task to update the speed every 500ms
         {
             let progress_q = progress_q.clone();
             let pb = pb.clone();
