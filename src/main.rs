@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         output: args.output,
     };
 
-    start_download(preferences, multi_progress).await?;
+    start_download(preferences, Some(multi_progress)).await?;
 
     debug!("Download complete");
     log::logger().flush();

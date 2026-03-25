@@ -42,7 +42,7 @@ pub(crate) struct DownloadPreferences {
 
 pub(crate) async fn start_download(
     specs: DownloadPreferences,
-    multi: MultiProgress,
+    multi: Option<MultiProgress>,
 ) -> Result<(), Box<dyn Error>> {
     let resource_handle = ResourceHandle::try_from(&specs.url)?;
 
@@ -139,7 +139,10 @@ pub(crate) async fn start_download(
     drop(tx_update);
     drop(download_worker);
 
-    spawn_progress_reporter(file_size, rx_progress, multi);
+    match multi {
+        Some(multi) => { spawn_progress_reporter(file_size, rx_progress, multi); }
+        None => drop(rx_progress), // workers use try_send; dropping the receiver is safe
+    }
 
     let resource_handle = Arc::new(resource_handle);
     tokio::spawn(async move {
@@ -268,4 +271,119 @@ async fn write_file_chunk(file: &mut File, chunk: &FileChunk) {
     file.write_all(chunk.0.as_ref())
         .await
         .expect("write failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// Responds to GET requests with full body or a 206 partial response when a
+    /// `Range: bytes=start-end` header is present. Used to simulate a server that
+    /// supports split/parallel downloads.
+    struct RangeAwareBody {
+        data: Bytes,
+    }
+
+    impl Respond for RangeAwareBody {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let total = self.data.len();
+            // http-types HeaderMap::get requires &HeaderName, so we iterate instead.
+            // Use .iter() on HeaderValues to get the raw &str, not the JSON display
+            let range_value: Option<String> = request
+                .headers
+                .iter()
+                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("range"))
+                .and_then(|(_, vals)| vals.iter().next().map(|v| v.as_str().to_owned()));
+
+            if let Some(range_str) = range_value {
+                let range_str = range_str.strip_prefix("bytes=").unwrap_or(&range_str).to_owned();
+                let (start_str, end_str) = range_str.split_once('-').unwrap();
+                let start: usize = start_str.trim().parse().unwrap();
+                // Clamp end to the last valid byte, as real servers do when the
+                // Range end overshoots (the chunk calc sends file_size, not file_size-1).
+                let end: usize = end_str.trim().parse::<usize>().unwrap().min(total - 1);
+                let slice = self.data.slice(start..=end);
+                // insert_header accepts &str but not String, so we bind first.
+                let content_range = format!("bytes {start}-{end}/{total}");
+                let content_length = slice.len().to_string();
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", content_range.as_str())
+                    .insert_header("Content-Length", content_length.as_str())
+                    .set_body_bytes(slice)
+            } else {
+                let content_length = total.to_string();
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", content_length.as_str())
+                    .set_body_bytes(self.data.clone())
+            }
+        }
+    }
+
+    /// Mounts HEAD and GET mocks for `/file` on a fresh MockServer.
+    /// The HEAD response advertises range support and content length.
+    /// The GET responder handles both full and ranged requests.
+    async fn setup_server(data: Bytes) -> (MockServer, Url) {
+        let server = MockServer::start().await;
+        let total = data.len();
+
+        let content_length = total.to_string();
+        Mock::given(method("HEAD"))
+            .and(path("/file"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", content_length.as_str())
+                    .insert_header("Accept-Ranges", "bytes"),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/file"))
+            .respond_with(RangeAwareBody { data })
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/file", server.uri()).parse().unwrap();
+        (server, url)
+    }
+
+    #[tokio::test]
+    async fn test_single_chunk_download() {
+        let data = Bytes::from(vec![0xABu8; 1024]); // 1 KB — fits in one chunk
+        let (_server, url) = setup_server(data.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out").to_str().unwrap().to_string();
+
+        start_download(
+            DownloadPreferences { url, preferred_splits: 1, output: Some(output.clone()) },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&output).unwrap(), data.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_multi_chunk_download() {
+        // 5 MB — splits into three 2 MB chunks (2 MB, 2 MB, 1 MB)
+        let data = Bytes::from((0u8..=255).cycle().take(5 * 1024 * 1024).collect::<Vec<_>>());
+        let (_server, url) = setup_server(data.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out").to_str().unwrap().to_string();
+
+        start_download(
+            DownloadPreferences { url, preferred_splits: 4, output: Some(output.clone()) },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&output).unwrap(), data.as_ref());
+    }
 }
