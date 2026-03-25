@@ -23,4 +23,5 @@ reqwest = { version = "0.11.18", features = ["blocking", "stream"] }
 simplelog = { version = "0.12.1", features = ["paris"] }
 thiserror = "1.0.44"
 tokio = { version = "1.29.1", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
 url = "2.4.0"
