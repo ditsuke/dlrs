@@ -75,7 +75,8 @@ pub(crate) async fn start_download(
         Some(count) => (0..count)
             .map(|i| {
                 let start = i as u64 * CHUNK_SIZE;
-                let end = cmp::min(start + CHUNK_SIZE, file_size.unwrap_or(0));
+                // ChunkRange end is inclusive to match HTTP Range header semantics.
+                let end = cmp::min(start + CHUNK_SIZE, file_size.unwrap()) - 1;
                 Some(ChunkRange { start, end })
             })
             .collect::<Vec<_>>(),
@@ -302,9 +303,7 @@ mod tests {
                 let range_str = range_str.strip_prefix("bytes=").unwrap_or(&range_str).to_owned();
                 let (start_str, end_str) = range_str.split_once('-').unwrap();
                 let start: usize = start_str.trim().parse().unwrap();
-                // Clamp end to the last valid byte, as real servers do when the
-                // Range end overshoots (the chunk calc sends file_size, not file_size-1).
-                let end: usize = end_str.trim().parse::<usize>().unwrap().min(total - 1);
+                let end: usize = end_str.trim().parse().unwrap();
                 let slice = self.data.slice(start..=end);
                 // insert_header accepts &str but not String, so we bind first.
                 let content_range = format!("bytes {start}-{end}/{total}");
