@@ -21,9 +21,9 @@ pub(crate) async fn get_headers_follow_redirects(
         .headers()
         .to_owned();
     if headers.get("Location").is_some() {
-        debug!("Redirecting to {:?}", headers.get("Location").unwrap());
-        let new_url = headers.get("Location").unwrap().to_str().unwrap();
-        let new_url = Url::parse(new_url)?;
+        let location = headers.get("Location").unwrap().to_str().unwrap();
+        warn!("Redirecting {} -> {}", url, location);
+        let new_url = Url::parse(location)?;
         get_headers_follow_redirects(client, &new_url).await?;
     }
     Ok((headers, url.clone()))

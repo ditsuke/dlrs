@@ -57,6 +57,7 @@ pub(crate) async fn start_download(
             if let Some(filename) = resource_specs.inferred_filename {
                 filename
             } else {
+                warn!("Could not infer filename from URL or headers; saving as \"download\"");
                 "download".into() // TODO: come up with a better default way
             }
         }
@@ -64,6 +65,9 @@ pub(crate) async fn start_download(
     debug!("Output filename: {}", output_filename);
 
     let file_size = resource_specs.size;
+    if file_size.is_none() {
+        warn!("Server did not send Content-Length; progress and split downloads unavailable");
+    }
     let chunk_count = match (file_size, resource_specs.supports_splits) {
         (Some(size), true) => Some(((size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32),
         _ => None,
@@ -83,9 +87,16 @@ pub(crate) async fn start_download(
     let download_worker_count = if resource_specs.supports_splits {
         specs.preferred_splits
     } else {
+        if specs.preferred_splits > 1 {
+            warn!(
+                "Server does not support range requests; ignoring --splits={}, downloading with 1 worker",
+                specs.preferred_splits
+            );
+        }
         1
     };
-    debug!("downloading with {download_worker_count} workers");
+    debug!("Downloading {} with {} worker(s), {} chunk(s)",
+        specs.url, download_worker_count, chunk_count.unwrap_or(1));
 
     let (s_chunks, r_update) = mpsc::channel::<DownloadUpdate>(download_worker_count as usize);
     let (s_processing_q, r_processing_q) = async_channel::unbounded::<ChunkSpec>();

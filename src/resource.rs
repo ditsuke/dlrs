@@ -102,11 +102,15 @@ impl ResourceHandle {
                             == "bytes"
                     })
                     .unwrap_or(false);
+                if !supports_splits {
+                    debug!("Server at {} does not advertise Accept-Ranges: bytes", url);
+                }
 
                 let mut size = headers
                     .get("Content-Length")
                     .map(|v| v.to_str().unwrap().parse::<u64>().unwrap());
                 if size == Some(0) {
+                    warn!("Server at {} returned Content-Length: 0; treating as unknown size", url);
                     size = None;
                 }
 
