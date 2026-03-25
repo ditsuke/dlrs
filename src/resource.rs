@@ -28,6 +28,8 @@ pub(crate) enum ResourceError {
     ReadError(ReadError),
     #[error("Handle does not support partial content")]
     NoPartialContentSupport,
+    #[error("Stalled: no data received for {0:?}")]
+    Stall(std::time::Duration),
 }
 
 impl From<http_utils::GetError> for ResourceError {

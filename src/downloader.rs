@@ -24,6 +24,7 @@ use crate::shared_types::{ByteCount, ChunkRange};
 const MB_TO_BYTES: u64 = 1024 * 1024;
 const CHUNK_SIZE: u64 = 2 * MB_TO_BYTES;
 const MAX_RETRIES: u32 = 3;
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 type ChunkBoundaries = Option<ChunkRange>;
 type FileChunk = (Bytes, ChunkBoundaries);
@@ -181,8 +182,12 @@ impl DownloadWorker {
 
                     let stream_err: Option<ResourceError>;
                     loop {
-                        match stream.try_next().await {
-                            Ok(Some(chunk)) => {
+                        match tokio::time::timeout(STALL_TIMEOUT, stream.try_next()).await {
+                            Err(_elapsed) => {
+                                stream_err = Some(ResourceError::Stall(STALL_TIMEOUT));
+                                break;
+                            }
+                            Ok(Ok(Some(chunk))) => {
                                 debug!("sending chunk for bounds {bounds:?} to writer");
                                 if self
                                     .tx_update
@@ -193,11 +198,11 @@ impl DownloadWorker {
                                     break 'outer; // writer gone
                                 }
                             }
-                            Ok(None) => {
+                            Ok(Ok(None)) => {
                                 stream_err = None;
                                 break;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 stream_err = Some(e);
                                 break;
                             }
