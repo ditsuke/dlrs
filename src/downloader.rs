@@ -1,6 +1,7 @@
 use std::cmp;
 use std::error::Error;
 use std::io::SeekFrom;
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -23,12 +24,13 @@ use crate::resource::{ResourceError};
 use crate::resource::ResourceHandle;
 use crate::shared_types::{ByteCount, ChunkRange};
 
-const MB_TO_BYTES: u32 = 1024 * 1024;
-const CHUNK_SIZE: u32 = 2 * MB_TO_BYTES;
+const MB_TO_BYTES: u64 = 1024 * 1024;
+const CHUNK_SIZE: u64 = 2 * MB_TO_BYTES;
+const MAX_RETRIES: u32 = 3;
 
 type ChunkBoundaries = Option<ChunkRange>;
 type FileChunk = (Bytes, ChunkBoundaries);
-type ChunkSpec = (ResourceHandle, ChunkBoundaries);
+type ChunkSpec = (ResourceHandle, ChunkBoundaries, u32); // last field = attempts so far
 enum DownloadUpdate {
     Chunk(Result<FileChunk, (ResourceError, ChunkSpec)>),
     Complete,
@@ -63,14 +65,14 @@ pub(crate) async fn start_download(
 
     let file_size = resource_specs.size;
     let chunk_count = match (file_size, resource_specs.supports_splits) {
-        (Some(size), true) => Some((size as f32 / CHUNK_SIZE as f32).ceil() as u32),
+        (Some(size), true) => Some(((size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32),
         _ => None,
     };
     debug!("File size: {:?}, chunk count: {chunk_count:?}", file_size);
     let chunk_bounds = match chunk_count {
         Some(count) => (0..count)
             .map(|i| {
-                let start = i * CHUNK_SIZE;
+                let start = i as u64 * CHUNK_SIZE;
                 let end = cmp::min(start + CHUNK_SIZE, file_size.unwrap_or(0));
                 Some(ChunkRange { start, end })
             })
@@ -100,7 +102,7 @@ pub(crate) async fn start_download(
         .await?;
 
     // TODO: we'd have to leave this untouched if we're resuming a download
-    output_file.set_len(file_size.unwrap_or(0) as u64).await?;
+    output_file.set_len(file_size.unwrap_or(0)).await?;
     let writer = Writer {
         output_file,
         chunk_count,
@@ -127,7 +129,7 @@ pub(crate) async fn start_download(
     future::join_all(
         chunk_bounds
             .iter()
-            .map(|bound| s_processing_q.send((handle.clone(), *bound)))
+            .map(|bound| s_processing_q.send((handle.clone(), *bound, 0)))
             .collect::<Vec<_>>(),
     )
     .await;
@@ -148,7 +150,7 @@ struct DownloadWorker {
 impl DownloadWorker {
     fn spawn(self) -> JoinHandle<()> {
         tokio::spawn(async move {
-            while let Ok((handle, bounds)) = self.r_processing_q.recv().await {
+            while let Ok((handle, bounds, attempts)) = self.r_processing_q.recv().await {
                 let r = handle
                     .stream_range(bounds, self.s_progress.clone())
                     .await
@@ -163,7 +165,7 @@ impl DownloadWorker {
                     .await;
                 if let Err(e) = r {
                     self.s_chunks
-                        .send(DownloadUpdate::Chunk(Err((e, (handle, bounds)))))
+                        .send(DownloadUpdate::Chunk(Err((e, (handle, bounds, attempts)))))
                         .await
                         .expect("failed to send error to writer");
                 }
@@ -236,11 +238,26 @@ impl Writer {
                         }
                     }
 
-                    DownloadUpdate::Chunk(Err((e, chunk_spec))) => {
-                        error!("Error downloading chunk: {}. Retrying...", e);
+                    DownloadUpdate::Chunk(Err((e, (handle, bounds, attempts)))) => {
+                        if attempts >= MAX_RETRIES {
+                            error!(
+                                "Chunk {:?} failed after {} attempts: {}. Aborting download.",
+                                bounds, MAX_RETRIES, e
+                            );
+                            windup_writer!(output_file, s_processing_q, r_chunks);
+                        }
+                        let delay = Duration::from_millis(500 * (1u64 << attempts.min(4)));
+                        warn!(
+                            "Chunk {:?} failed (attempt {}/{}): {}. Retrying in {:?}...",
+                            bounds,
+                            attempts + 1,
+                            MAX_RETRIES,
+                            e,
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
                         s_processing_q
-                            .clone()
-                            .send(chunk_spec)
+                            .send((handle, bounds, attempts + 1))
                             .await
                             .expect("send failed");
                     }
@@ -259,7 +276,7 @@ impl Writer {
 enum WriteChunkError {}
 async fn write_file_chunk(file: &mut File, chunk: &FileChunk) -> Result<(), WriteChunkError> {
     if let Some(range) = &chunk.1 {
-        file.seek(SeekFrom::Start(range.start as u64))
+        file.seek(SeekFrom::Start(range.start))
             .await
             .expect("seek failed");
     }

@@ -13,14 +13,14 @@ use crate::shared_types::ByteCount;
 
 pub(crate) struct ProgressReporter {
     rx_progress: mpsc::Receiver<ByteCount>,
-    total_size: Option<u32>,
+    total_size: Option<u64>,
     multi_progress: MultiProgress,
 }
 
 impl ProgressReporter {
     pub(crate) fn new(
         rx_progress: mpsc::Receiver<ByteCount>,
-        total_size: Option<u32>,
+        total_size: Option<u64>,
         multi_progress: MultiProgress,
     ) -> Self {
         Self {
@@ -36,7 +36,7 @@ impl ProgressReporter {
 }
 
 pub(crate) fn spawn_progress_reporter(
-    total_size: Option<u32>,
+    total_size: Option<u64>,
     mut rx_progress: mpsc::Receiver<ByteCount>,
     multi: MultiProgress,
 ) -> JoinHandle<()> {
@@ -44,9 +44,7 @@ pub(crate) fn spawn_progress_reporter(
         let mut progress = 0;
         type ProgressPoint = (ByteCount, Instant);
         let progress_q = Arc::new(RwLock::new(CircularBuffer::<50, ProgressPoint>::new()));
-        let pb = total_size.map_or_else(ProgressBar::new_spinner, |size| {
-            ProgressBar::new(size as u64)
-        });
+        let pb = total_size.map_or_else(ProgressBar::new_spinner, ProgressBar::new);
         let pb = multi.add(pb);
         pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta}) ({msg})")
         .unwrap()

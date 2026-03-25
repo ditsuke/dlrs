@@ -76,7 +76,7 @@ impl TryFrom<&Url> for ResourceHandle {
 #[derive(Debug)]
 pub(crate) struct ResourceSpec {
     pub(crate) url: Url,
-    pub(crate) size: Option<u32>,
+    pub(crate) size: Option<u64>,
     pub(crate) supports_splits: bool,
     pub(crate) inferred_filename: Option<String>,
 }
@@ -105,7 +105,7 @@ impl ResourceHandle {
 
                 let mut size = headers
                     .get("Content-Length")
-                    .map(|v| v.to_str().unwrap().parse::<u32>().unwrap());
+                    .map(|v| v.to_str().unwrap().parse::<u64>().unwrap());
                 if size == Some(0) {
                     size = None;
                 }
