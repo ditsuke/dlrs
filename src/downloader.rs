@@ -10,18 +10,14 @@ use futures::TryStreamExt;
 
 use indicatif::MultiProgress;
 
-
-use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use tokio::{sync::mpsc, task::JoinHandle};
 use url::Url;
 
-
 use crate::progress_reporter::spawn_progress_reporter;
-use crate::resource::{ResourceError};
-
+use crate::resource::ResourceError;
 use crate::resource::ResourceHandle;
 use crate::shared_types::{ByteCount, ChunkRange};
 
@@ -31,10 +27,11 @@ const MAX_RETRIES: u32 = 3;
 
 type ChunkBoundaries = Option<ChunkRange>;
 type FileChunk = (Bytes, ChunkBoundaries);
-type ChunkSpec = (Arc<ResourceHandle>, ChunkBoundaries, u32); // last field = attempts so far
+type ChunkSpec = (Arc<ResourceHandle>, ChunkBoundaries);
+
 enum DownloadUpdate {
-    Chunk(Result<FileChunk, (ResourceError, ChunkSpec)>),
-    Complete,
+    Chunk(FileChunk),
+    FatalError(ResourceError),
 }
 
 pub(crate) struct DownloadPreferences {
@@ -47,9 +44,9 @@ pub(crate) async fn start_download(
     specs: DownloadPreferences,
     multi: MultiProgress,
 ) -> Result<(), Box<dyn Error>> {
-    let handle = ResourceHandle::try_from(&specs.url)?;
+    let resource_handle = ResourceHandle::try_from(&specs.url)?;
 
-    let resource_specs = handle.get_specs().await?;
+    let resource_specs = resource_handle.get_specs().await?;
     debug!("File to download has specs: {:?}", resource_specs);
 
     let output_filename = match specs.output {
@@ -96,17 +93,21 @@ pub(crate) async fn start_download(
         }
         1
     };
-    debug!("Downloading {} with {} worker(s), {} chunk(s)",
-        specs.url, download_worker_count, chunk_count.unwrap_or(1));
+    debug!(
+        "Downloading {} with {} worker(s), {} chunk(s)",
+        specs.url,
+        download_worker_count,
+        chunk_count.unwrap_or(1)
+    );
 
-    let (s_chunks, r_update) = mpsc::channel::<DownloadUpdate>(download_worker_count as usize);
-    let (s_processing_q, r_processing_q) =
+    let (tx_update, rx_update) = mpsc::channel::<DownloadUpdate>(download_worker_count as usize);
+    let (tx_chunk_spec, rx_chunk_spec) =
         async_channel::bounded::<ChunkSpec>(download_worker_count as usize * 4);
-    let (s_progress, r_progress) = mpsc::channel::<u64>(download_worker_count as usize);
+    let (tx_progress, rx_progress) = mpsc::channel::<u64>(download_worker_count as usize);
 
-    let mut handles = vec![];
+    let mut worker_handles = vec![];
 
-    // writer/processor
+    // FIXME: define truncate behavior
     let output_file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -116,181 +117,149 @@ pub(crate) async fn start_download(
 
     // TODO: we'd have to leave this untouched if we're resuming a download
     output_file.set_len(file_size.unwrap_or(0)).await?;
-    let writer = Writer {
-        output_file,
-        chunk_count,
-        r_chunks: r_update,
-        s_processing_q: s_processing_q.clone(),
-    };
-    handles.push(writer.spawn());
 
-    // download workers
+    worker_handles.push(
+        Writer {
+            output_file,
+            r_chunks: rx_update,
+        }
+        .spawn(),
+    );
+
     let download_worker = DownloadWorker {
-        r_processing_q: r_processing_q.clone(),
-        s_chunks: s_chunks.clone(),
-        s_progress: s_progress.clone(),
-        single_chunk_dl: matches!(chunk_count, Some(1) | None),
+        rx_chunk_spec: rx_chunk_spec.clone(),
+        tx_update: tx_update.clone(),
+        tx_progress: tx_progress.clone(),
     };
     for _ in 0..download_worker_count {
-        let download_worker = download_worker.clone();
-        handles.push(download_worker.spawn());
+        worker_handles.push(download_worker.clone().spawn());
     }
 
-    spawn_progress_reporter(file_size, r_progress, multi);
+    // Drop unused clones
+    drop(tx_update);
+    drop(download_worker);
 
-    // Send splits to download queue (bounded — producer blocks when workers are busy)
-    let handle = Arc::new(handle);
-    let s_processing_q_producer = s_processing_q.clone();
+    spawn_progress_reporter(file_size, rx_progress, multi);
+
+    let resource_handle = Arc::new(resource_handle);
     tokio::spawn(async move {
         for bound in chunk_bounds {
-            s_processing_q_producer
-                .send((handle.clone(), bound, 0))
+            if tx_chunk_spec
+                .send((resource_handle.clone(), bound))
                 .await
-                .ok();
+                .is_err()
+            {
+                break; // all workers gone (e.g. fatal error already aborted them)
+            }
         }
     });
 
-    futures::future::join_all(handles).await;
+    futures::future::join_all(worker_handles).await;
     debug!("exiting download function");
     Ok(())
 }
 
 #[derive(Clone, Debug)]
 struct DownloadWorker {
-    r_processing_q: async_channel::Receiver<ChunkSpec>,
-    s_chunks: mpsc::Sender<DownloadUpdate>,
-    s_progress: mpsc::Sender<ByteCount>,
-    single_chunk_dl: bool,
+    rx_chunk_spec: async_channel::Receiver<ChunkSpec>,
+    tx_update: mpsc::Sender<DownloadUpdate>,
+    tx_progress: mpsc::Sender<ByteCount>,
 }
 
 impl DownloadWorker {
     fn spawn(self) -> JoinHandle<()> {
         tokio::spawn(async move {
-            while let Ok((handle, bounds, attempts)) = self.r_processing_q.recv().await {
-                let r = handle
-                    .stream_range(bounds, self.s_progress.clone())
-                    .await
-                    .try_for_each(|chunk| async {
-                        debug!("sending chunk for bounds {bounds:?} to writer");
-                        self.s_chunks
-                            .send(DownloadUpdate::Chunk(Ok((chunk, bounds))))
-                            .await
-                            .expect("failed to send file chunk to writer");
-                        Ok(())
-                    })
-                    .await;
-                if let Err(e) = r {
-                    self.s_chunks
-                        .send(DownloadUpdate::Chunk(Err((e, (handle, bounds, attempts)))))
-                        .await
-                        .expect("failed to send error to writer");
-                }
+            'outer: while let Ok((handle, bounds)) = self.rx_chunk_spec.recv().await {
+                let mut attempts = 0u32;
+                'retry: loop {
+                    let stream = handle.stream_range(bounds, self.tx_progress.clone()).await;
+                    tokio::pin!(stream);
 
-                if self.single_chunk_dl {
-                    self.s_chunks.send(DownloadUpdate::Complete).await.ok();
+                    let stream_err: Option<ResourceError>;
+                    loop {
+                        match stream.try_next().await {
+                            Ok(Some(chunk)) => {
+                                debug!("sending chunk for bounds {bounds:?} to writer");
+                                if self
+                                    .tx_update
+                                    .send(DownloadUpdate::Chunk((chunk, bounds)))
+                                    .await
+                                    .is_err()
+                                {
+                                    break 'outer; // writer gone
+                                }
+                            }
+                            Ok(None) => {
+                                stream_err = None;
+                                break;
+                            }
+                            Err(e) => {
+                                stream_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+
+                    let Some(e) = stream_err else { break 'retry }; // None = chunk succeeded
+                    if attempts >= MAX_RETRIES {
+                        error!(
+                            "Chunk {:?} failed after {} attempts: {}. Aborting download.",
+                            bounds, MAX_RETRIES, e
+                        );
+                        self.tx_update
+                            .send(DownloadUpdate::FatalError(e))
+                            .await
+                            .ok();
+                        break 'outer;
+                    }
+                    let delay = Duration::from_millis(500 * (1u64 << attempts.min(4)));
+                    warn!(
+                        "Chunk {:?} failed (attempt {}/{}): {}. Retrying in {:?}...",
+                        bounds,
+                        attempts + 1,
+                        MAX_RETRIES,
+                        e,
+                        delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempts += 1;
                 }
             }
+            // Dropping s_chunks here signals the writer that one fewer worker is active.
         })
     }
-}
-
-macro_rules! windup_writer {
-    ($file:ident, $s_processing:ident, $r_chunks:ident) => {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        $file.shutdown().await.expect("shutdown failed");
-        $s_processing.close();
-        $r_chunks.close();
-        break;
-    };
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ChunkState {
-    Done,
-    Pending,
 }
 
 struct Writer {
     output_file: File,
-    chunk_count: Option<u32>,
     r_chunks: mpsc::Receiver<DownloadUpdate>,
-    s_processing_q: async_channel::Sender<ChunkSpec>,
 }
 
 impl Writer {
     fn spawn(self) -> JoinHandle<()> {
-        let chunk_count = self.chunk_count;
-        let s_processing_q = self.s_processing_q;
         let mut r_chunks = self.r_chunks;
         let mut output_file = self.output_file;
-        let mut chunk_states = chunk_count.map(|count| vec![ChunkState::Pending; count as usize]);
 
         tokio::spawn(async move {
-            let mut chunks_received = 0;
-            while let Some(chunk) = r_chunks.recv().await {
-                match chunk {
-                    DownloadUpdate::Chunk(Ok(chunk)) => {
-                        write_file_chunk(&mut output_file, &chunk)
-                            .await
-                            .expect("write failed");
-                        let (_, chunk_range) = chunk;
-                        let chunk_index = if let Some(range) = chunk_range {
-                            range.start / CHUNK_SIZE
-                        } else {
-                            0
-                        } as usize;
-                        if let Some(ref mut states) = chunk_states {
-                            states[chunk_index] = ChunkState::Done;
-                        }
-
-                        chunks_received += 1;
-                        let we_are_done = match chunk_count {
-                            Some(count) => chunks_received == count,
-                            None => false,
-                        };
-                        if we_are_done {
-                            debug!("download complete (all chunks received)");
-                            windup_writer!(output_file, s_processing_q, r_chunks);
-                        }
+            // Loop exits either when all worker senders drop (channel closed = success)
+            // or on a FatalError from a worker.
+            while let Some(update) = r_chunks.recv().await {
+                match update {
+                    DownloadUpdate::Chunk(chunk) => {
+                        write_file_chunk(&mut output_file, &chunk).await;
                     }
-
-                    DownloadUpdate::Chunk(Err((e, (handle, bounds, attempts)))) => {
-                        if attempts >= MAX_RETRIES {
-                            error!(
-                                "Chunk {:?} failed after {} attempts: {}. Aborting download.",
-                                bounds, MAX_RETRIES, e
-                            );
-                            windup_writer!(output_file, s_processing_q, r_chunks);
-                        }
-                        let delay = Duration::from_millis(500 * (1u64 << attempts.min(4)));
-                        warn!(
-                            "Chunk {:?} failed (attempt {}/{}): {}. Retrying in {:?}...",
-                            bounds,
-                            attempts + 1,
-                            MAX_RETRIES,
-                            e,
-                            delay
-                        );
-                        tokio::time::sleep(delay).await;
-                        s_processing_q
-                            .send((handle, bounds, attempts + 1))
-                            .await
-                            .expect("send failed");
-                    }
-
-                    DownloadUpdate::Complete => {
-                        debug!("download complete (completion signal received)");
-                        windup_writer!(output_file, s_processing_q, r_chunks);
+                    DownloadUpdate::FatalError(e) => {
+                        error!("Download failed: {}. Aborting.", e);
+                        break;
                     }
                 }
             }
+            output_file.shutdown().await.expect("file shutdown failed");
         })
     }
 }
 
-#[derive(Error, Debug)]
-enum WriteChunkError {}
-async fn write_file_chunk(file: &mut File, chunk: &FileChunk) -> Result<(), WriteChunkError> {
+async fn write_file_chunk(file: &mut File, chunk: &FileChunk) {
     if let Some(range) = &chunk.1 {
         file.seek(SeekFrom::Start(range.start))
             .await
@@ -299,5 +268,4 @@ async fn write_file_chunk(file: &mut File, chunk: &FileChunk) -> Result<(), Writ
     file.write_all(chunk.0.as_ref())
         .await
         .expect("write failed");
-    Ok(())
 }
