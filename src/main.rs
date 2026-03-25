@@ -6,6 +6,7 @@ mod downloader;
 mod http_utils;
 mod progress_reporter;
 mod resource;
+mod resume;
 mod shared_types;
 
 use std::error::Error;
@@ -29,6 +30,11 @@ struct CliArgs {
 
     #[arg(short, long, default_value = None)]
     output: Option<String>,
+
+    /// Overwrite an existing output file or discard a mismatched partial download
+    /// and restart from scratch.
+    #[arg(short, long, default_value_t = false)]
+    force: bool,
 }
 
 #[tokio::main]
@@ -54,6 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         url,
         preferred_splits,
         output: args.output,
+        force: args.force,
     };
 
     start_download(preferences, Some(multi_progress)).await?;

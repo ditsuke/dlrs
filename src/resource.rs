@@ -81,6 +81,8 @@ pub(crate) struct ResourceSpec {
     pub(crate) size: Option<u64>,
     pub(crate) supports_splits: bool,
     pub(crate) inferred_filename: Option<String>,
+    pub(crate) etag: Option<String>,
+    pub(crate) last_modified: Option<String>,
 }
 
 impl ResourceHandle {
@@ -124,11 +126,22 @@ impl ResourceHandle {
                     Some(inferred_filename)
                 };
 
+                let etag = headers
+                    .get("ETag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_owned());
+                let last_modified = headers
+                    .get("Last-Modified")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_owned());
+
                 Ok(ResourceSpec {
                     url: url.clone(),
                     size,
                     supports_splits,
                     inferred_filename,
+                    etag,
+                    last_modified,
                 })
             }
         }

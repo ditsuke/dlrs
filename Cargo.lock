@@ -329,6 +329,8 @@ dependencies = [
  "indicatif-log-bridge",
  "log",
  "reqwest",
+ "serde",
+ "serde_json",
  "simplelog",
  "tempfile",
  "thiserror",
