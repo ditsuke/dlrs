@@ -1,11 +1,12 @@
 use std::cmp;
 use std::error::Error;
 use std::io::SeekFrom;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 
-use futures::{future, TryStreamExt};
+use futures::TryStreamExt;
 
 use indicatif::MultiProgress;
 
@@ -30,7 +31,7 @@ const MAX_RETRIES: u32 = 3;
 
 type ChunkBoundaries = Option<ChunkRange>;
 type FileChunk = (Bytes, ChunkBoundaries);
-type ChunkSpec = (ResourceHandle, ChunkBoundaries, u32); // last field = attempts so far
+type ChunkSpec = (Arc<ResourceHandle>, ChunkBoundaries, u32); // last field = attempts so far
 enum DownloadUpdate {
     Chunk(Result<FileChunk, (ResourceError, ChunkSpec)>),
     Complete,
@@ -99,7 +100,8 @@ pub(crate) async fn start_download(
         specs.url, download_worker_count, chunk_count.unwrap_or(1));
 
     let (s_chunks, r_update) = mpsc::channel::<DownloadUpdate>(download_worker_count as usize);
-    let (s_processing_q, r_processing_q) = async_channel::unbounded::<ChunkSpec>();
+    let (s_processing_q, r_processing_q) =
+        async_channel::bounded::<ChunkSpec>(download_worker_count as usize * 4);
     let (s_progress, r_progress) = mpsc::channel::<u64>(download_worker_count as usize);
 
     let mut handles = vec![];
@@ -136,14 +138,17 @@ pub(crate) async fn start_download(
 
     spawn_progress_reporter(file_size, r_progress, multi);
 
-    // Send splits to download queue
-    future::join_all(
-        chunk_bounds
-            .iter()
-            .map(|bound| s_processing_q.send((handle.clone(), *bound, 0)))
-            .collect::<Vec<_>>(),
-    )
-    .await;
+    // Send splits to download queue (bounded — producer blocks when workers are busy)
+    let handle = Arc::new(handle);
+    let s_processing_q_producer = s_processing_q.clone();
+    tokio::spawn(async move {
+        for bound in chunk_bounds {
+            s_processing_q_producer
+                .send((handle.clone(), bound, 0))
+                .await
+                .ok();
+        }
+    });
 
     futures::future::join_all(handles).await;
     debug!("exiting download function");
@@ -294,6 +299,5 @@ async fn write_file_chunk(file: &mut File, chunk: &FileChunk) -> Result<(), Writ
     file.write_all(chunk.0.as_ref())
         .await
         .expect("write failed");
-    file.flush().await.expect("flush failed");
     Ok(())
 }
