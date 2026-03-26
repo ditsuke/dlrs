@@ -12,8 +12,9 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::{sync::mpsc, task::JoinHandle};
 use url::Url;
 
+use crate::http_utils;
 use crate::progress_reporter::spawn_progress_reporter;
-use crate::resource::{ResourceError, ResourceHandle};
+use crate::resource::{self, ResourceError, ResourceHandle};
 use crate::resume::{self, DownloadState};
 use crate::shared_types::{ByteCount, ChunkRange};
 
@@ -24,7 +25,7 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 type ChunkBoundaries = Option<ChunkRange>;
 type FileChunk = (Bytes, ChunkBoundaries);
-type ChunkSpec = (Arc<ResourceHandle>, ChunkBoundaries);
+type ChunkSpec = ChunkBoundaries;
 
 enum DownloadUpdate {
     Chunk(FileChunk),
@@ -115,25 +116,30 @@ pub(crate) async fn start_download(
     let write_path = if is_chunked { &part_path } else { &output };
     let file = open_output_file(write_path, (!is_resuming).then_some(specs.size.unwrap_or(0))).await?;
 
-    let worker = DownloadWorker {
-        rx_chunk_spec: rx_spec.clone(),
-        tx_update: tx_update.clone(),
-        tx_progress: tx_progress.clone(),
-    };
+    // Use the post-redirect URL from specs so workers always talk to the real origin.
+    let url = Arc::new(specs.url);
     let handles: Vec<JoinHandle<()>> = std::iter::once(Writer { output_file: file, r_chunks: rx_update, resume_ctx }.spawn())
-        .chain((0..worker_count).map(|_| worker.clone().spawn()))
+        .chain((0..worker_count).map(|_| {
+            DownloadWorker {
+                client: http_utils::build_http_client().expect("failed to build HTTP client"),
+                url: url.clone(),
+                rx_chunk_spec: rx_spec.clone(),
+                tx_update: tx_update.clone(),
+                tx_progress: tx_progress.clone(),
+            }
+            .spawn()
+        }))
         .collect();
-    drop((tx_update, worker));
+    drop(tx_update);
 
     match multi {
         Some(m) => { spawn_progress_reporter(specs.size, rx_progress, m); }
         None => drop(rx_progress), // workers use try_send; dropping the receiver is safe
     }
 
-    let handle = Arc::new(handle);
     tokio::spawn(async move {
         for bound in pending {
-            if tx_spec.send((handle.clone(), bound)).await.is_err() {
+            if tx_spec.send(bound).await.is_err() {
                 break; // all workers gone (fatal error already aborted them)
             }
         }
@@ -198,8 +204,9 @@ async fn open_output_file(path: &str, preallocate: Option<u64>) -> tokio::io::Re
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
 struct DownloadWorker {
+    client: reqwest::Client,
+    url: Arc<Url>,
     rx_chunk_spec: async_channel::Receiver<ChunkSpec>,
     tx_update: mpsc::Sender<DownloadUpdate>,
     tx_progress: mpsc::Sender<ByteCount>,
@@ -208,10 +215,10 @@ struct DownloadWorker {
 impl DownloadWorker {
     fn spawn(self) -> JoinHandle<()> {
         tokio::spawn(async move {
-            'outer: while let Ok((handle, bounds)) = self.rx_chunk_spec.recv().await {
+            'outer: while let Ok(bounds) = self.rx_chunk_spec.recv().await {
                 let mut attempts = 0u32;
                 'retry: loop {
-                    let stream = handle.stream_range(bounds, self.tx_progress.clone()).await;
+                    let stream = resource::stream_range(&self.client, &self.url, bounds, self.tx_progress.clone()).await;
                     tokio::pin!(stream);
 
                     let stream_err: Option<ResourceError>;

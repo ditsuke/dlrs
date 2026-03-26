@@ -77,3 +77,11 @@ pub(crate) fn get_file_name_from_headers(headers: &HeaderMap) -> Option<String> 
         .find(|s| s.starts_with("filename="))
         .map(|s| s.replace("filename=", ""))
 }
+
+/// Builds a configured HTTP client. Each download worker gets its own instance
+/// so connections are never shared or multiplexed across workers.
+pub(crate) fn build_http_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .build()
+}
