@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::shared_types::{ByteCount, ChunkRange};
+use crate::ftp;
 use crate::http;
 
 #[derive(Error, Debug)]
@@ -18,7 +19,7 @@ pub(crate) enum ReadError {
     #[error("HTTP error: {0}")]
     Http(reqwest::Error),
     #[error("FTP error: {0}")]
-    _Ftp(String),
+    Ftp(#[from] ftp::FtpError),
 }
 
 #[derive(Error, Debug)]
@@ -39,6 +40,12 @@ impl From<http::GetError> for ResourceError {
                 ResourceError::NoPartialContentSupport
             }
         }
+    }
+}
+
+impl From<ftp::FtpError> for ResourceError {
+    fn from(e: ftp::FtpError) -> Self {
+        ResourceError::ReadError(ReadError::Ftp(e))
     }
 }
 
@@ -85,8 +92,30 @@ pub(crate) struct ResourceSpec {
 impl ResourceHandle {
     pub(crate) async fn get_specs(&self) -> anyhow::Result<ResourceSpec> {
         match self {
-            ResourceHandle::Ftp(_url) => {
-                todo!()
+            ResourceHandle::Ftp(url) => {
+                let probe = ftp::probe_resource(url)
+                    .await
+                    .with_context(|| format!("failed to probe FTP resource {url}"))?;
+
+                let supports_splits = probe.supports_rest && probe.size.is_some();
+                if !supports_splits {
+                    debug!("FTP server at {} does not support REST or SIZE", url);
+                }
+
+                let inferred_filename = url
+                    .path_segments()
+                    .and_then(|s| s.last())
+                    .map(str::to_owned)
+                    .filter(|s| !s.is_empty());
+
+                Ok(ResourceSpec {
+                    url: probe.url,
+                    size: probe.size,
+                    supports_splits,
+                    inferred_filename,
+                    etag: None,
+                    last_modified: probe.mdtm,
+                })
             }
             ResourceHandle::Http { client, url } => {
                 let probe = http::probe::probe_resource(client, url)
@@ -132,31 +161,47 @@ impl ResourceHandle {
     }
 }
 
-/// Streams a single byte range from `url`, buffering network sub-chunks into
-/// full chunk-sized [`Bytes`] before yielding them to the caller.
+/// Streams a single byte range from the given resource handle, buffering network
+/// sub-chunks into full chunk-sized [`Bytes`] before yielding them to the caller.
 pub(crate) async fn stream_range(
-    client: &reqwest::Client,
-    url: &Url,
+    handle: &ResourceHandle,
     range: Option<ChunkRange>,
     s_progress: mpsc::Sender<ByteCount>,
 ) -> impl Stream<Item = Result<Bytes, ResourceError>> {
-    let (client, url) = (client.clone(), url.clone());
+    let handle = handle.clone();
     try_stream! {
-        let mut stream = http::get_stream(&client, &url, range).await?;
-
         let buffer_capacity = range.map_or(1024, |r| (r.end - r.start + 1) as usize);
         let mut buffer = BytesMut::with_capacity(buffer_capacity);
         let mut cumulative = 0;
 
-        while let Some(sub_chunk) = stream.next().await {
-            let sub_chunk = sub_chunk?;
-            cumulative += sub_chunk.len();
-            s_progress.try_send(sub_chunk.len() as ByteCount).ok();
-            buffer.extend_from_slice(&sub_chunk);
-            if cumulative >= buffer_capacity {
-                yield buffer.freeze();
-                cumulative = 0;
-                buffer = BytesMut::with_capacity(buffer_capacity);
+        match handle {
+            ResourceHandle::Http { client, url } => {
+                let mut stream = http::get_stream(&client, &url, range).await?;
+                while let Some(sub_chunk) = stream.next().await {
+                    let sub_chunk = sub_chunk?;
+                    cumulative += sub_chunk.len();
+                    s_progress.try_send(sub_chunk.len() as ByteCount).ok();
+                    buffer.extend_from_slice(&sub_chunk);
+                    if cumulative >= buffer_capacity {
+                        yield buffer.freeze();
+                        cumulative = 0;
+                        buffer = BytesMut::with_capacity(buffer_capacity);
+                    }
+                }
+            }
+            ResourceHandle::Ftp(url) => {
+                let mut stream = ftp::get_stream(&url, range).await?;
+                while let Some(sub_chunk) = stream.next().await {
+                    let sub_chunk = sub_chunk?;
+                    cumulative += sub_chunk.len();
+                    s_progress.try_send(sub_chunk.len() as ByteCount).ok();
+                    buffer.extend_from_slice(&sub_chunk);
+                    if cumulative >= buffer_capacity {
+                        yield buffer.freeze();
+                        cumulative = 0;
+                        buffer = BytesMut::with_capacity(buffer_capacity);
+                    }
+                }
             }
         }
 
