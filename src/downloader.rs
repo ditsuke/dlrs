@@ -88,6 +88,9 @@ pub(crate) async fn start_download(
     };
 
     let is_resuming = resume_state.is_some();
+    let already_downloaded: u64 = resume_state.as_ref()
+        .map(|s| s.completed_chunks.iter().map(|r| r.end - r.start + 1).sum())
+        .unwrap_or(0);
 
     if !is_resuming && tokio::fs::metadata(&output).await.is_ok() && !prefs.force {
         bail!("output file '{output}' already exists; use --force to overwrite");
@@ -137,7 +140,7 @@ pub(crate) async fn start_download(
     drop(tx_update);
 
     match multi {
-        Some(m) => { spawn_progress_reporter(specs.size, rx_progress, m); }
+        Some(m) => { spawn_progress_reporter(specs.size, already_downloaded, rx_progress, m); }
         None => drop(rx_progress), // workers use try_send; dropping the receiver is safe
     }
 
