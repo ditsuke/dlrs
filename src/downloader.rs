@@ -1,6 +1,5 @@
 use std::cmp;
 use std::io::SeekFrom;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,7 +11,6 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use url::Url;
 
 use anyhow::{bail, Context};
-use crate::http;
 use crate::progress_reporter::spawn_progress_reporter;
 use crate::resource::{self, ResourceError, ResourceHandle};
 use crate::resume::{self, DownloadState};
@@ -124,12 +122,13 @@ pub(crate) async fn start_download(
         .with_context(|| format!("failed to open output file '{write_path}'"))?;
 
     // Use the post-redirect URL from specs so workers always talk to the real origin.
-    let url = Arc::new(specs.url);
+    let worker_url = specs.url;
     let handles: Vec<JoinHandle<()>> = std::iter::once(Writer { output_file: file, r_chunks: rx_update, resume_ctx }.spawn())
         .chain((0..worker_count).map(|_| {
+            let worker_handle = ResourceHandle::try_from(&worker_url)
+                .expect("failed to create resource handle for worker");
             DownloadWorker {
-                client: http::build_http_client().expect("failed to build HTTP client"),
-                url: url.clone(),
+                handle: worker_handle,
                 rx_chunk_spec: rx_spec.clone(),
                 tx_update: tx_update.clone(),
                 tx_progress: tx_progress.clone(),
@@ -212,8 +211,7 @@ async fn open_output_file(path: &str, preallocate: Option<u64>) -> tokio::io::Re
 // ── Worker ────────────────────────────────────────────────────────────────────
 
 struct DownloadWorker {
-    client: reqwest::Client,
-    url: Arc<Url>,
+    handle: ResourceHandle,
     rx_chunk_spec: async_channel::Receiver<ChunkSpec>,
     tx_update: mpsc::Sender<DownloadUpdate>,
     tx_progress: mpsc::Sender<ByteCount>,
@@ -225,7 +223,7 @@ impl DownloadWorker {
             'outer: while let Ok(bounds) = self.rx_chunk_spec.recv().await {
                 let mut attempts = 0u32;
                 'retry: loop {
-                    let stream = resource::stream_range(&self.client, &self.url, bounds, self.tx_progress.clone()).await;
+                    let stream = resource::stream_range(&self.handle, bounds, self.tx_progress.clone()).await;
                     tokio::pin!(stream);
 
                     let stream_err: Option<ResourceError>;
