@@ -77,7 +77,7 @@ pub(crate) async fn start_download(
                 .await?;
         if let Some(ref s) = state {
             let total = chunk_count(specs.size.unwrap());
-            debug!("resuming: {}/{total} chunks already done", s.completed_chunks.len());
+            info!("resuming: {}/{total} chunks already done", s.completed_chunks.len());
         }
         state
     } else {
@@ -106,7 +106,7 @@ pub(crate) async fn start_download(
     };
 
     let worker_count = effective_worker_count(specs.supports_splits, prefs.preferred_splits);
-    debug!("downloading {} — {worker_count} worker(s), {} chunk(s)", prefs.url, pending.len());
+    info!("downloading {} — {worker_count} worker(s), {} chunk(s)", prefs.url, pending.len());
 
     let (tx_update, rx_update) = mpsc::channel(worker_count as usize);
     let (tx_spec, rx_spec) = async_channel::bounded(worker_count as usize * 4);
@@ -318,7 +318,7 @@ impl Writer {
                         .await
                         .expect("failed to rename .part to final output");
                     tokio::fs::remove_file(&ctx.state_path).await.ok();
-                    debug!("renamed {} → {}", ctx.part_path, ctx.final_path);
+                    info!("saved to {}", ctx.final_path);
                 }
             }
         })
