@@ -74,6 +74,6 @@ pub(crate) fn spawn_progress_reporter(
 
         let speed = progress as f64 / pb.elapsed().as_secs_f64();
         pb.finish_with_message(format!("({})", format_speed(speed)));
-        println!("");
+        println!();
     })
 }

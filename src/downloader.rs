@@ -12,7 +12,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use url::Url;
 
 use anyhow::{bail, Context};
-use crate::http_utils;
+use crate::http;
 use crate::progress_reporter::spawn_progress_reporter;
 use crate::resource::{self, ResourceError, ResourceHandle};
 use crate::resume::{self, DownloadState};
@@ -128,7 +128,7 @@ pub(crate) async fn start_download(
     let handles: Vec<JoinHandle<()>> = std::iter::once(Writer { output_file: file, r_chunks: rx_update, resume_ctx }.spawn())
         .chain((0..worker_count).map(|_| {
             DownloadWorker {
-                client: http_utils::build_http_client().expect("failed to build HTTP client"),
+                client: http::build_http_client().expect("failed to build HTTP client"),
                 url: url.clone(),
                 rx_chunk_spec: rx_spec.clone(),
                 tx_update: tx_update.clone(),
@@ -168,7 +168,7 @@ fn chunk_ranges(file_size: u64) -> impl Iterator<Item = ChunkRange> {
 }
 
 fn chunk_count(file_size: u64) -> u64 {
-    (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE
+    file_size.div_ceil(CHUNK_SIZE)
 }
 
 /// Returns the list of chunk boundaries that still need to be downloaded,
@@ -202,7 +202,7 @@ fn effective_worker_count(supports_splits: bool, preferred: u8) -> u8 {
 }
 
 async fn open_output_file(path: &str, preallocate: Option<u64>) -> tokio::io::Result<File> {
-    let file = OpenOptions::new().create(true).read(true).write(true).open(path).await?;
+    let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path).await?;
     if let Some(size) = preallocate {
         file.set_len(size).await?;
     }

@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::shared_types::{ByteCount, ChunkRange};
-use crate::{http_utils, probe};
+use crate::http;
 
 #[derive(Error, Debug)]
 pub(crate) enum ReadError {
@@ -31,11 +31,11 @@ pub(crate) enum ResourceError {
     Stall(std::time::Duration),
 }
 
-impl From<http_utils::GetError> for ResourceError {
-    fn from(e: http_utils::GetError) -> Self {
+impl From<http::GetError> for ResourceError {
+    fn from(e: http::GetError) -> Self {
         match e {
-            http_utils::GetError::Http(e) => ResourceError::ReadError(ReadError::Http(e)),
-            http_utils::GetError::NoPartialContentSupportWhenceRequested => {
+            http::GetError::Http(e) => ResourceError::ReadError(ReadError::Http(e)),
+            http::GetError::NoPartialContentSupportWhenceRequested => {
                 ResourceError::NoPartialContentSupport
             }
         }
@@ -62,7 +62,7 @@ impl TryFrom<&Url> for ResourceHandle {
         match url.scheme() {
             "http" | "https" => Ok(ResourceHandle::Http {
                 url: url.to_owned(),
-                client: http_utils::build_http_client()?,
+                client: http::build_http_client()?,
             }),
             "ftp" => Ok(ResourceHandle::Ftp(url.to_owned())),
             scheme => Err(HandleCreationError::UnsupportedProtocol {
@@ -89,7 +89,7 @@ impl ResourceHandle {
                 todo!()
             }
             ResourceHandle::Http { client, url } => {
-                let probe = probe::probe_resource(client, url)
+                let probe = http::probe::probe_resource(client, url)
                     .await
                     .with_context(|| format!("failed to probe {url}"))?;
                 debug!("probe headers: {:?}", probe.headers);
@@ -115,8 +115,8 @@ impl ResourceHandle {
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_owned());
 
-                let inferred_filename = http_utils::get_file_name_from_headers(&probe.headers)
-                    .or_else(|| probe.url.path_segments()?.last().map(str::to_owned))
+                let inferred_filename = http::get_file_name_from_headers(&probe.headers)
+                    .or_else(|| probe.url.path_segments()?.next_back().map(str::to_owned))
                     .filter(|s| !s.is_empty());
 
                 Ok(ResourceSpec {
@@ -142,7 +142,7 @@ pub(crate) async fn stream_range(
 ) -> impl Stream<Item = Result<Bytes, ResourceError>> {
     let (client, url) = (client.clone(), url.clone());
     try_stream! {
-        let mut stream = http_utils::get_stream(&client, &url, range).await?;
+        let mut stream = http::get_stream(&client, &url, range).await?;
 
         let buffer_capacity = range.map_or(1024, |r| (r.end - r.start + 1) as usize);
         let mut buffer = BytesMut::with_capacity(buffer_capacity);

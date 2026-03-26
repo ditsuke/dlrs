@@ -8,6 +8,8 @@ use url::Url;
 
 use crate::shared_types::ChunkRange;
 
+pub(crate) mod probe;
+
 /// Builds a configured HTTP client. Each download worker gets its own instance
 /// so connections are never shared or multiplexed across workers.
 pub(crate) fn build_http_client() -> Result<Client, reqwest::Error> {

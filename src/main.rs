@@ -3,8 +3,7 @@ extern crate log;
 extern crate simplelog;
 
 mod downloader;
-mod http_utils;
-mod probe;
+mod http;
 mod progress_reporter;
 mod resource;
 mod resume;
