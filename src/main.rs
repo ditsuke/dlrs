@@ -3,12 +3,11 @@ extern crate log;
 extern crate simplelog;
 
 mod downloader;
-mod http_utils;
+mod http;
 mod progress_reporter;
 mod resource;
+mod resume;
 mod shared_types;
-
-use std::error::Error;
 
 use clap::Parser;
 use downloader::{start_download, DownloadPreferences};
@@ -29,13 +28,18 @@ struct CliArgs {
 
     #[arg(short, long, default_value = None)]
     output: Option<String>,
+
+    /// Overwrite an existing output file or discard a mismatched partial download
+    /// and restart from scratch.
+    #[arg(short, long, default_value_t = false)]
+    force: bool,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> anyhow::Result<()> {
     let multi_progress = MultiProgress::new();
     let logger = TermLogger::new(
-        simplelog::LevelFilter::Error,
+        simplelog::LevelFilter::Info,
         simplelog::Config::default(),
         simplelog::TerminalMode::Mixed,
         simplelog::ColorChoice::Auto,
@@ -54,6 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         url,
         preferred_splits,
         output: args.output,
+        force: args.force,
     };
 
     start_download(preferences, Some(multi_progress)).await?;

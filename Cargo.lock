@@ -317,6 +317,7 @@ dependencies = [
 name = "dlrs"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
  "async-channel",
  "async-recursion",
  "async-stream",
@@ -329,6 +330,8 @@ dependencies = [
  "indicatif-log-bridge",
  "log",
  "reqwest",
+ "serde",
+ "serde_json",
  "simplelog",
  "tempfile",
  "thiserror",

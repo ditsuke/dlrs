@@ -22,11 +22,12 @@ fn format_speed(bytes_per_sec: f64) -> String {
 
 pub(crate) fn spawn_progress_reporter(
     total_size: Option<u64>,
+    initial_progress: u64,
     mut rx_progress: mpsc::Receiver<ByteCount>,
     multi: MultiProgress,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut progress = 0;
+        let mut progress = initial_progress;
         type ProgressPoint = (ByteCount, Instant);
         let progress_q = Arc::new(RwLock::new(CircularBuffer::<50, ProgressPoint>::new()));
         let pb = total_size.map_or_else(ProgressBar::new_spinner, ProgressBar::new);
@@ -35,6 +36,7 @@ pub(crate) fn spawn_progress_reporter(
         .unwrap()
         .with_key("eta", |state: &ProgressState, w: &mut dyn std::fmt::Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
         .progress_chars("#>-"));
+        pb.set_position(initial_progress);
 
         // Aborted automatically when dropped (i.e. when the outer task exits for any reason).
         let _speed_task = AbortOnDropHandle::new({
@@ -72,6 +74,6 @@ pub(crate) fn spawn_progress_reporter(
 
         let speed = progress as f64 / pb.elapsed().as_secs_f64();
         pb.finish_with_message(format!("({})", format_speed(speed)));
-        println!("");
+        println!();
     })
 }
