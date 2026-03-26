@@ -1,5 +1,4 @@
 use std::cmp;
-use std::error::Error;
 use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +11,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::{sync::mpsc, task::JoinHandle};
 use url::Url;
 
+use anyhow::{bail, Context};
 use crate::http_utils;
 use crate::progress_reporter::spawn_progress_reporter;
 use crate::resource::{self, ResourceError, ResourceHandle};
@@ -51,9 +51,11 @@ struct ResumeContext {
 pub(crate) async fn start_download(
     prefs: DownloadPreferences,
     multi: Option<MultiProgress>,
-) -> Result<(), Box<dyn Error>> {
-    let handle = ResourceHandle::try_from(&prefs.url)?;
-    let specs = handle.get_specs().await?;
+) -> anyhow::Result<()> {
+    let handle = ResourceHandle::try_from(&prefs.url)
+        .with_context(|| format!("unsupported URL: {}", prefs.url))?;
+    let specs = handle.get_specs().await
+        .with_context(|| format!("failed to fetch resource metadata for {}", prefs.url))?;
     debug!("resource specs: {:?}", specs);
 
     if specs.size.is_none() {
@@ -88,7 +90,7 @@ pub(crate) async fn start_download(
     let is_resuming = resume_state.is_some();
 
     if !is_resuming && tokio::fs::metadata(&output).await.is_ok() && !prefs.force {
-        return Err(format!("output file '{output}' already exists; use --force to overwrite").into());
+        bail!("output file '{output}' already exists; use --force to overwrite");
     }
 
     let pending = pending_chunks(specs.size, specs.supports_splits, resume_state.as_ref());
@@ -114,7 +116,9 @@ pub(crate) async fn start_download(
     let (tx_progress, rx_progress) = mpsc::channel(worker_count as usize);
 
     let write_path = if is_chunked { &part_path } else { &output };
-    let file = open_output_file(write_path, (!is_resuming).then_some(specs.size.unwrap_or(0))).await?;
+    let file = open_output_file(write_path, (!is_resuming).then_some(specs.size.unwrap_or(0)))
+        .await
+        .with_context(|| format!("failed to open output file '{write_path}'"))?;
 
     // Use the post-redirect URL from specs so workers always talk to the real origin.
     let url = Arc::new(specs.url);

@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
@@ -8,25 +8,12 @@ use url::Url;
 
 use crate::shared_types::ChunkRange;
 
-#[async_recursion::async_recursion]
-pub(crate) async fn get_headers_follow_redirects(
-    client: &Client,
-    url: &Url,
-) -> Result<(HeaderMap, Url), Box<dyn Error>> {
-    let headers = client
-        .head(url.as_str())
-        .send()
-        .await?
-        .error_for_status()?
-        .headers()
-        .to_owned();
-    if headers.get("Location").is_some() {
-        let location = headers.get("Location").unwrap().to_str().unwrap();
-        warn!("Redirecting {} -> {}", url, location);
-        let new_url = Url::parse(location)?;
-        get_headers_follow_redirects(client, &new_url).await?;
-    }
-    Ok((headers, url.clone()))
+/// Builds a configured HTTP client. Each download worker gets its own instance
+/// so connections are never shared or multiplexed across workers.
+pub(crate) fn build_http_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .build()
 }
 
 #[derive(Error, Debug)]
@@ -53,7 +40,7 @@ pub(crate) async fn get_stream(
     }
 
     let response = client
-        .get(url.to_owned())
+        .get(url.as_str())
         .headers(headers)
         .send()
         .await?
@@ -67,7 +54,6 @@ pub(crate) async fn get_stream(
 }
 
 pub(crate) fn get_file_name_from_headers(headers: &HeaderMap) -> Option<String> {
-    debug!("headers are {headers:?}");
     headers
         .get("Content-Disposition")?
         .to_str()
@@ -75,13 +61,5 @@ pub(crate) fn get_file_name_from_headers(headers: &HeaderMap) -> Option<String> 
         .split(';')
         .map(|s| s.trim())
         .find(|s| s.starts_with("filename="))
-        .map(|s| s.replace("filename=", ""))
-}
-
-/// Builds a configured HTTP client. Each download worker gets its own instance
-/// so connections are never shared or multiplexed across workers.
-pub(crate) fn build_http_client() -> Result<Client, reqwest::Error> {
-    Client::builder()
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .build()
+        .and_then(|s| s.strip_prefix("filename=").map(str::to_owned))
 }

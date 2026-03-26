@@ -1,5 +1,4 @@
-use std::error::Error;
-use std::time::Duration;
+use anyhow::Context;
 
 use async_stream::try_stream;
 use bytes::{Bytes, BytesMut};
@@ -11,8 +10,8 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use url::Url;
 
-use crate::http_utils;
 use crate::shared_types::{ByteCount, ChunkRange};
+use crate::{http_utils, probe};
 
 #[derive(Error, Debug)]
 pub(crate) enum ReadError {
@@ -63,9 +62,7 @@ impl TryFrom<&Url> for ResourceHandle {
         match url.scheme() {
             "http" | "https" => Ok(ResourceHandle::Http {
                 url: url.to_owned(),
-                client: reqwest::Client::builder()
-                    .tcp_keepalive(Some(Duration::from_secs(2)))
-                    .build()?,
+                client: http_utils::build_http_client()?,
             }),
             "ftp" => Ok(ResourceHandle::Ftp(url.to_owned())),
             scheme => Err(HandleCreationError::UnsupportedProtocol {
@@ -86,57 +83,44 @@ pub(crate) struct ResourceSpec {
 }
 
 impl ResourceHandle {
-    pub(crate) async fn get_specs(&self) -> Result<ResourceSpec, Box<dyn Error>> {
+    pub(crate) async fn get_specs(&self) -> anyhow::Result<ResourceSpec> {
         match self {
             ResourceHandle::Ftp(_url) => {
                 todo!()
             }
             ResourceHandle::Http { client, url } => {
-                let (headers, url) = http_utils::get_headers_follow_redirects(client, url).await?;
-                debug!("headers: {:?}", headers);
+                let probe = probe::probe_resource(client, url)
+                    .await
+                    .with_context(|| format!("failed to probe {url}"))?;
+                debug!("probe headers: {:?}", probe.headers);
 
-                let supports_splits = headers
-                    .get("Accept-Ranges")
-                    .map(|v| {
-                        v.to_str()
-                            .map_err(|e| {
-                                format!("failed to map Accept-Ranges from {url} to a string: {e}")
-                            })
-                            .unwrap()
-                            == "bytes"
-                    })
-                    .unwrap_or(false);
+                let supports_splits = probe.supports_splits;
                 if !supports_splits {
-                    debug!("Server at {} does not advertise Accept-Ranges: bytes", url);
+                    debug!("server at {} does not support range requests", probe.url);
                 }
 
-                let mut size = headers
-                    .get("Content-Length")
-                    .map(|v| v.to_str().unwrap().parse::<u64>().unwrap());
-                if size == Some(0) {
-                    warn!("Server at {} returned Content-Length: 0; treating as unknown size", url);
-                    size = None;
+                let size = probe.size;
+                if size.is_none() {
+                    warn!("could not determine file size from probe response");
                 }
 
-                let inferred_filename = http_utils::get_file_name_from_headers(&headers)
-                    .unwrap_or_else(|| url.path_segments().unwrap().last().unwrap().to_owned());
-                let inferred_filename = if inferred_filename.is_empty() {
-                    None
-                } else {
-                    Some(inferred_filename)
-                };
-
-                let etag = headers
+                let etag = probe
+                    .headers
                     .get("ETag")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_owned());
-                let last_modified = headers
+                let last_modified = probe
+                    .headers
                     .get("Last-Modified")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_owned());
 
+                let inferred_filename = http_utils::get_file_name_from_headers(&probe.headers)
+                    .or_else(|| probe.url.path_segments()?.last().map(str::to_owned))
+                    .filter(|s| !s.is_empty());
+
                 Ok(ResourceSpec {
-                    url: url.clone(),
+                    url: probe.url,
                     size,
                     supports_splits,
                     inferred_filename,
@@ -146,58 +130,38 @@ impl ResourceHandle {
             }
         }
     }
+}
 
-    pub(crate) async fn stream_range(
-        &self,
-        range: Option<ChunkRange>,
-        s_progress: mpsc::Sender<ByteCount>,
-    ) -> impl Stream<Item = Result<Bytes, ResourceError>> {
-        match self {
-            ResourceHandle::Http { client, url } => {
-                let (client, url) = (client.clone(), url.clone());
-                try_stream! {
-                    let mut stream = http_utils::get_stream(&client, &url, range).await?;
+/// Streams a single byte range from `url`, buffering network sub-chunks into
+/// full chunk-sized [`Bytes`] before yielding them to the caller.
+pub(crate) async fn stream_range(
+    client: &reqwest::Client,
+    url: &Url,
+    range: Option<ChunkRange>,
+    s_progress: mpsc::Sender<ByteCount>,
+) -> impl Stream<Item = Result<Bytes, ResourceError>> {
+    let (client, url) = (client.clone(), url.clone());
+    try_stream! {
+        let mut stream = http_utils::get_stream(&client, &url, range).await?;
 
-                    // HACK: this feels so wrong on so many levels.
-                    // While I can't exactly figure out a "good" way to do this,
-                    // The solution should be verification of chunks and whether
-                    // they're done or not on the end of the writer.
-                    // OKAY, idea: the writer maintains an array of of chunks,
-                    // keeping track Chunk::ToBeWritten, along with the start
-                    // and end of the chunk. When a chunk is written, it's
-                    // marked as Chunk::Written only if the entire chunk was
-                    // written. If the chunk was only partially written, it's
-                    // Chunk::ToBeWritten bytecount is updated to reflect the
-                    // remaining bytes to be written. Once the chunk is
-                    // completely written we can update the chunks_written
-                    // counter and move on to the next chunk, thus allowing
-                    // it to figure out the termination condition on its own too.
-                    let buffer_capacity = if let Some(range) = range {
-                        (range.end - range.start + 1) as usize
-                    } else {
-                        1000 // TODO: WTF``
-                    };
-                    let mut buffer = BytesMut::with_capacity(buffer_capacity);
-                    let mut cumulative = 0;
+        let buffer_capacity = range.map_or(1024, |r| (r.end - r.start + 1) as usize);
+        let mut buffer = BytesMut::with_capacity(buffer_capacity);
+        let mut cumulative = 0;
 
-                    while let Some(sub_chunk) = stream.next().await {
-                        let sub_chunk = sub_chunk?;
-                        cumulative += sub_chunk.len();
-                        s_progress.try_send(sub_chunk.len() as ByteCount).ok();
-                        buffer.extend_from_slice(&sub_chunk);
-                        if cumulative >= buffer_capacity {
-                            yield buffer.freeze();
-                            cumulative = 0;
-                            buffer = BytesMut::with_capacity(buffer_capacity);
-                        }
-                    }
-
-                    if !buffer.is_empty() {
-                        yield buffer.freeze();
-                    }
-                }
+        while let Some(sub_chunk) = stream.next().await {
+            let sub_chunk = sub_chunk?;
+            cumulative += sub_chunk.len();
+            s_progress.try_send(sub_chunk.len() as ByteCount).ok();
+            buffer.extend_from_slice(&sub_chunk);
+            if cumulative >= buffer_capacity {
+                yield buffer.freeze();
+                cumulative = 0;
+                buffer = BytesMut::with_capacity(buffer_capacity);
             }
-            _ => todo!(),
+        }
+
+        if !buffer.is_empty() {
+            yield buffer.freeze();
         }
     }
 }

@@ -1,5 +1,4 @@
-use std::error::Error;
-
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -80,14 +79,19 @@ pub(crate) fn state_path(output: &str) -> String {
     format!("{}.dlrs", output)
 }
 
-pub(crate) fn load_state(path: &str) -> Option<DownloadState> {
-    let content = std::fs::read_to_string(path).ok()?;
+pub(crate) async fn load_state(path: &str) -> Option<DownloadState> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
     serde_json::from_str(&content).ok()
 }
 
-pub(crate) async fn save_state(path: &str, state: &DownloadState) -> std::io::Result<()> {
+async fn discard_partial(part: &str, state: &str) {
+    tokio::fs::remove_file(part).await.ok();
+    tokio::fs::remove_file(state).await.ok();
+}
+
+pub(crate) async fn save_state(path: &str, state: &DownloadState) -> anyhow::Result<()> {
     let content = serde_json::to_string(state).expect("state serialization failed");
-    tokio::fs::write(path, content).await
+    tokio::fs::write(path, content).await.with_context(|| format!("failed to write resume state to {path}"))
 }
 
 /// Inspects the sidecar files for `output` and returns the existing
@@ -101,36 +105,32 @@ pub(crate) async fn resolve(
     etag: &Option<String>,
     last_modified: &Option<String>,
     force: bool,
-) -> Result<Option<DownloadState>, Box<dyn Error>> {
+) -> anyhow::Result<Option<DownloadState>> {
     let part = part_path(output);
     let state = state_path(output);
     let part_exists = tokio::fs::metadata(&part).await.is_ok();
     let state_exists = tokio::fs::metadata(&state).await.is_ok();
 
     match (part_exists, state_exists) {
-        (true, true) => match load_state(&state) {
+        (true, true) => match load_state(&state).await {
             Some(s) if s.is_valid_for(url, file_size, etag, last_modified) => Ok(Some(s)),
             Some(_) if force => {
                 warn!("Resume state invalid; restarting from scratch (--force)");
-                tokio::fs::remove_file(&part).await.ok();
-                tokio::fs::remove_file(&state).await.ok();
+                discard_partial(&part, &state).await;
                 Ok(None)
             }
-            Some(_) => Err(
+            Some(_) => bail!(
                 "Resume state validation failed (URL, size, or ETag mismatch). \
                  Use --force to discard the partial download and restart."
-                    .into(),
             ),
             None if force => {
                 warn!("Corrupt resume state; restarting from scratch (--force)");
-                tokio::fs::remove_file(&part).await.ok();
-                tokio::fs::remove_file(&state).await.ok();
+                discard_partial(&part, &state).await;
                 Ok(None)
             }
-            None => Err(
+            None => bail!(
                 "Found a partial download but the resume state is corrupt or \
                  unreadable. Use --force to discard and restart."
-                    .into(),
             ),
         },
         (true, false) => {
@@ -139,11 +139,10 @@ pub(crate) async fn resolve(
                 tokio::fs::remove_file(&part).await.ok();
                 Ok(None)
             } else {
-                Err(format!(
+                bail!(
                     "Found partial file '{part}' without a resume state file. \
                      Use --force to discard it and restart."
                 )
-                .into())
             }
         }
         (false, true) => {

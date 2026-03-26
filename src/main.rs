@@ -4,12 +4,11 @@ extern crate simplelog;
 
 mod downloader;
 mod http_utils;
+mod probe;
 mod progress_reporter;
 mod resource;
 mod resume;
 mod shared_types;
-
-use std::error::Error;
 
 use clap::Parser;
 use downloader::{start_download, DownloadPreferences};
@@ -38,7 +37,7 @@ struct CliArgs {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> anyhow::Result<()> {
     let multi_progress = MultiProgress::new();
     let logger = TermLogger::new(
         simplelog::LevelFilter::Info,
